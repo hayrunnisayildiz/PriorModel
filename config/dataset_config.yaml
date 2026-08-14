@@ -1,0 +1,304 @@
+# config/dataset_config.yaml
+# Keivitsa Ni-Cu-PGE Deposit — Multi-Physics Dataset Configuration
+# Generated from database/ inventory analysis
+# CRS: KKJ / Finland Zone 3 (EPSG:2391 equivalent)
+
+project:
+  name: "Keivitsa"
+  location: "Sodankylä, Finland"
+  crs:
+    name: "Finland_Zone_3"
+    epsg: 2391
+    datum: "KKJ"
+    unit: "meter"
+    note: >
+      All shapefiles use KKJ_EAST (X/easting) and KKJ_NORTH (Y/northing).
+      GTK .txt exports swap names: Kkj_X = northing, Kkj_y = easting.
+
+# ── GridSpec ──────────────────────────────────────────────────────────────
+gridspec:
+  # Deposit-focused extent (recommended for 3D inversion)
+  deposit:
+    xmin: 3490900   # KKJ Easting  (m) — collar+ground geo + 500 m pad
+    xmax: 3505500
+    ymin: 7504920   # KKJ Northing (m)
+    ymax: 7515500
+    zmin: -800      # m RL — below deepest hole (~969 m from ~194 m surface)
+    zmax: 400       # m RL — above max topography (~354 m)
+    dx: 50          # m — suggested cell size (adjust per resolution needs)
+    dy: 50
+    dz: 25
+
+  # Regional extent (includes 1994 aerogeophysics coverage)
+  regional:
+    xmin: 3487500
+    xmax: 3508500
+    ymin: 7499500
+    ymax: 7520500
+    zmin: -800
+    zmax: 400
+    dx: 100
+    dy: 100
+    dz: 50
+
+  active: deposit   # which GridSpec block to use by default
+
+# ── 1D Borehole Data ──────────────────────────────────────────────────────
+borehole:
+  collar:
+    path: "database/3_DRILLINGS/Logs/Shape_files/collar.shp"
+    format: shapefile
+    id_column: HOLE_ID
+    columns:
+      easting:  { name: KKJ_EAST,  dtype: float64, unit: m }
+      northing: { name: KKJ_NORTH, dtype: float64, unit: m }
+      elevation: { name: Z,         dtype: float64, unit: m }
+      length:   { name: LENGTH,    dtype: float64, unit: m }
+      azimuth:  { name: STARTAZIM, dtype: float64, unit: deg }
+      dip:      { name: STARTDIP,  dtype: float64, unit: deg }
+    n_holes: 522
+
+  survey:
+    path: "database/3_DRILLINGS/Logs/Shape_files/survey.shp"
+    format: shapefile
+    id_column: HOLE_ID
+    columns:
+      depth:   { name: DEPTH,   dtype: float64, unit: m }
+      dip:     { name: DIP,     dtype: float64, unit: deg }
+      azimuth: { name: AZIMUTH, dtype: float64, unit: deg }
+    n_records: 3621
+
+  lithology:
+    path: "database/3_DRILLINGS/Logs/Shape_files/rocktype.shp"
+    format: shapefile
+    columns:
+      from:      { name: FROM,      dtype: float64, unit: m }
+      to:        { name: TO,        dtype: float64, unit: m }
+      rocktype:  { name: ROCKTYPE,  dtype: string }
+      rockgroup: { name: ROCKGROUP, dtype: string }
+
+  assay:
+    base_path: "database/3_DRILLINGS/Assays/Shape_files/"
+    format: shapefile
+    id_column: HOLE_ID
+    depth_columns:
+      from: { name: FROM, dtype: float64, unit: m }
+      to:   { name: TO,   dtype: float64, unit: m }
+    coord_columns:
+      easting:  { name: KKJ_EAST,  dtype: float64, unit: m }
+      northing: { name: KKJ_NORTH, dtype: float64, unit: m }
+      elevation: { name: Z,         dtype: float64, unit: m }
+    sample_coord_columns:
+      easting:  { name: S_KKJ_EAST,  dtype: float64, unit: m }
+      northing: { name: S_KKJ_NORT,  dtype: float64, unit: m }
+      elevation: { name: S_Z,         dtype: float64, unit: m }
+    default_unit: ppm
+    methods:
+      - file: d511p.shp
+        code: "511P"
+        description: "ICP-OES multi-element (primary)"
+        elements: [AG, AL, AS, B, BA, CA, CD, CO, CR, CU, FE, K, LA, LI,
+                   MG, MN, MO, NA, NI, P, PB, S, SB, SC, SI, SR, TH, TI, V, Y, ZN, BE]
+        key_elements: [CU, NI, CO, FE, S]
+      - file: d511a.shp
+        code: "511A"
+        elements: [AG, CO, CU, MN, NI, PB, ZN, FE]
+      - file: d519u.shp
+        code: "519U"
+        description: "Fire assay — Au/PGM"
+        elements: [AU, PD, PT, TE, RH]
+        key_elements: [AU, PD, PT]
+      - file: d519a.shp
+        code: "519A"
+        elements: [AU, PD]
+      - file: d714m.shp
+        code: "714M"
+        elements: [AG, AU, IR, OS, PD, PT, RE, RH, RU]
+      - file: d175x.shp
+        code: "175X"
+        description: "XRF whole-rock"
+        elements: [CU, NI, CR, FE, S, ZN, PB, AL2O3, CAO, FE2O3, SIO2, TIO2]
+    txt_mirror_path: "database/3_DRILLINGS/Assays/Shape_files/"
+    txt_delimiter: " ^ "
+    txt_coord_map:   # GTK naming — X/Y swapped vs shapefile
+      easting:  ReiKkj_y
+      northing: ReiKkj_X
+      elevation: Rei_Z
+
+  petrophysics:
+    path: "database/3_DRILLINGS/Downhole_soundings_and_core_measurements/petroph.shp"
+    format: shapefile
+    columns:
+      depth:     { name: DEPTH,  dtype: float64, unit: m }
+      density:   { name: DSR_D,  dtype: float64, unit: kg/m3, note: "Dry density" }
+      mag_susc:  { name: PTR_K,  dtype: float64, unit: SI×10-6 }
+      resistivity: { name: LUO_R, dtype: float64, unit: ohm.m }
+    n_records: 62976
+
+# ── 2D Surface Geophysics (Ground) ──────────────────────────────────────
+ground_geophysics:
+  base_path: "database/5_GROUND_GEOPHYSICS/xyz/"
+  format: xyz_gtk
+  comment_prefix: "/"
+  coord_columns: [X, Y]   # col1=easting, col2=northing
+  coord_unit: m
+
+  gravimetric:
+    path: "database/5_GROUND_GEOPHYSICS/xyz/gravimetric/"
+    value_column: GR
+    value_unit: mGal
+    elevation_column: korkeus
+    elevation_unit: m
+    channel_name: gravity
+    files:
+      - file: g3714121.xyz
+        scope: deposit   # Keivitsa local survey — fits deposit GridSpec
+      - file: g3732031.xyz
+        scope: regional  # wider regional survey — use with regional GridSpec only
+
+  magnetic:
+    path: "database/5_GROUND_GEOPHYSICS/xyz/magnetic/"
+    files: [m3714111.xyz, m3714121.xyz, m3714122.xyz, j3714121.xyz]
+    value_column: MG
+    value_unit: nT
+    channel_name: magnetic_tmi
+
+  ip:
+    path: "database/5_GROUND_GEOPHYSICS/xyz/IP/"
+    files: [i3714121.xyz, i3714122.xyz]
+    value_columns: [IP, OV]
+    value_units: [mV/V, ohm.m]
+    channel_names: [ip_chargeability, ip_resistivity]
+
+  sp:
+    path: "database/5_GROUND_GEOPHYSICS/xyz/SP/"
+    files: [o3714121.xyz, o3714122.xyz, o3714123.xyz]
+    value_column: SP
+    value_unit: mV
+    channel_name: self_potential
+
+  vlf:
+    path: "database/5_GROUND_GEOPHYSICS/xyz/vlf/"
+    files: [v3714121.xyz, v3714122.xyz, v3714123.xyz,
+            v3714124.xyz, v3714125.xyz, v3714126.xyz]
+    value_columns: [ov, vk]
+    value_units: [ohm.m, deg]
+    channel_names: [vlf_resistivity, vlf_phase]
+
+  slingram:
+    path: "database/5_GROUND_GEOPHYSICS/xyz/slingram/"
+    files: [s3714124.xyz]
+    value_columns: [Re_pct, Im_pct]
+    value_unit: percent
+    channel_names: [slingram_real, slingram_imag]
+
+  maxmin:
+    path: "database/5_GROUND_GEOPHYSICS/xyz/maxmin/"
+    files: [x3714121.xyz, x3714122.xyz]
+    value_columns: [Re_444, Im_444, Re_888, Im_888, Re_1666, Im_1666, Re_3555, Im_3555]
+    channel_names: [maxmin_re_444, maxmin_im_444, maxmin_re_888, maxmin_im_888,
+                     maxmin_re_1666, maxmin_im_1666, maxmin_re_3555, maxmin_im_3555]
+
+  lp:
+    path: "database/5_GROUND_GEOPHYSICS/xyz/LP/"
+    files: [l3714121.xyz]
+    value_column: Lat_pot
+    value_unit: mV
+    channel_name: load_potential
+
+# ── Aerogeophysics (1994) ─────────────────────────────────────────────────
+aero_geophysics:
+  base_path: "database/aero/"
+  format: xyz_gtk
+  survey_year: 1994
+  coord_columns: [X, Y]
+  coord_unit: m
+
+  magnetic:
+    path: "database/aero/magnetic/"
+    files:
+      - file: ml94kevitsa.XYZ
+        description: "Total magnetic intensity"
+        value_column: MGL
+        value_unit: nT
+      - file: mr94kevitsa.XYZ
+        description: "Reduced-to-pole magnetic"
+        value_column: MGL
+        value_unit: nT
+
+  em:
+    path: "database/aero/em/"
+    files:
+      - file: em94kevitsa.XYZ
+        description: "EM in-phase / quadrature response"
+        value_columns: [RE, IM]
+        value_units: [raw, raw]
+        elevation_column: RALT
+      - file: ap94kevitsa.XYZ
+        description: "EM amplitude (LFA) / phase (LFS, deg)"
+        value_columns: [LFA, LFS]
+        value_units: [raw, deg]
+        elevation_column: RALT
+
+  radiometry:
+    path: "database/aero/radiometry/"
+    files: [ra94kevitsa.XYZ]
+    value_columns: [TOT, KAL, URA, THO]
+    channel_names: [radiometry_total, radiometry_k, radiometry_u, radiometry_th]
+
+  elevation_column: RALT
+  elevation_unit: m
+
+# ── Surface Geochemistry ──────────────────────────────────────────────────
+geochemistry:
+  base_path: "database/4_GEOCHEMISTRY/"
+  format: shapefile
+  columns:
+    id:       { name: ID_NUMBER, dtype: string }
+    easting:  { name: KKJ_X,     dtype: float64, unit: m }   # ~3.49M easting
+    northing: { name: KKJ_Y,     dtype: float64, unit: m }   # ~7.51M northing
+    depth:    { name: DEPTH,     dtype: float64, unit: m }
+    material: { name: MATERIAL,  dtype: string }
+  datasets:
+    - file: g37349.shp
+      elements: [CO_511A, CU_511A, NI_511A, PB_511A, ZN_511A, AU_519U, PD_519U]
+      n_samples: 171
+    - file: g6735.shp
+      elements: [CO_511A, CU_511A, NI_511A, AU_519U, PD_519U]
+      n_samples: 349
+    - file: g39054.shp
+      elements: [CO_511A, CU_511A, NI_511A, PB_511A, ZN_511A, AU_519U, PD_519U]
+      n_samples: 226
+    - file: g6734a.shp
+      elements: [CO_511A, CU_511A, NI_511A, PB_511A, ZN_511A, AU_519U, PD_519U]
+      n_samples: 171
+    - file: g37322.shp
+      elements: [CO_511A, CU_511A, NI_511A, PB_511A, ZN_511A, AG_511A, AU_519U, PD_519U]
+      n_samples: 54
+
+# ── Auxiliary ─────────────────────────────────────────────────────────────
+auxiliary:
+  claim_areas:
+    path: "database/1_CLAIM_AREAS/Relinquished_claims.shp"
+    format: shapefile
+
+  documentation:
+    data_sets: "database/0_DATA_SETS/Description of data sets.doc"
+    aero_survey: "database/aero/GTK_AEROGEOPHYSICAL_ SURVEY_ DESCRIPTION.pdf"
+    keivitsa_report: "database/keivitsa/source/gtk/report/"
+
+# ── Tensor channel mapping (for Lux prior network) ────────────────────────
+tensor_channels:
+  # Maps to (X, Y, Z, C, B) layout per .cursorrules
+  # v1 subset — extend with maxmin, lp, vlf_phase, aero EM/radiometry as needed
+  - { id: 0,  source: ground_geophysics.gravimetric,  name: gravity,        unit: mGal }
+  - { id: 1,  source: ground_geophysics.magnetic,    name: magnetic_tmi,   unit: nT }
+  - { id: 2,  source: aero_geophysics.magnetic,      name: aero_magnetic,  unit: nT }
+  - { id: 3,  source: ground_geophysics.ip,          name: ip_chargeability, unit: mV/V }
+  - { id: 4,  source: ground_geophysics.sp,          name: self_potential, unit: mV }
+  - { id: 5,  source: ground_geophysics.vlf,         name: vlf_resistivity, unit: ohm.m }
+  - { id: 6,  source: ground_geophysics.slingram,    name: slingram_real,  unit: percent }
+  - { id: 7,  source: borehole.assay,                name: cu_ppm,         unit: ppm, element: CU }
+  - { id: 8,  source: borehole.assay,                name: ni_ppm,         unit: ppm, element: NI }
+  - { id: 9,  source: borehole.petrophysics,         name: density,        unit: kg/m3 }
+  - { id: 10, source: borehole.lithology,            name: rocktype,       unit: categorical }
