@@ -5,6 +5,9 @@ Smart Prior Generator & Physics-Constrained 3D Gravity Inversion — orchestrato
 Usage (from project root):
     julia --project=. main.jl
 
+Colab (cwd is /content — do not use --project=. from there):
+    julia --project=/content/PriorModel /content/PriorModel/main.jl
+
 Prerequisites:
     julia --project=. src/training/train_prior.jl   # produces models/best_prior_model.jld2
 
@@ -16,7 +19,15 @@ Pipeline:
 =#
 
 using Pkg
-Pkg.activate(@__DIR__)
+include(joinpath(@__DIR__, "src", "pkg_setup.jl"))
+activate_project!(@__DIR__)
+
+# Load LuxCUDA (CUDA + cuDNN) before Lux network includes (Julia 1.12 world-age).
+try
+    using LuxCUDA
+catch err
+    @info "LuxCUDA unavailable; inference will use CPU" exception=err project=Base.active_project()
+end
 
 using Random
 using Statistics
@@ -27,6 +38,8 @@ using Lux
 
 const ROOT = @__DIR__
 
+include(joinpath(ROOT, "src", "gpu_utils.jl"))
+GPUUtils.init_cuda!()
 include(joinpath(ROOT, "src", "fusion", "GridSpec.jl"))
 include(joinpath(ROOT, "src", "data", "patch_loader.jl"))
 include(joinpath(ROOT, "src", "networks", "prior_unet3d.jl"))
@@ -34,6 +47,7 @@ include(joinpath(ROOT, "src", "physics_inversion", "ForwardGravity.jl"))
 include(joinpath(ROOT, "src", "physics_inversion", "Misfit.jl"))
 include(joinpath(ROOT, "src", "physics_inversion", "InversionSolver.jl"))
 
+using .GPUUtils: cuda_available, to_device, device_label, cuda_diagnostics, gpu_forward
 using .PriorUNet3DLayers: UnifiedPriorUNet3D, replace_nan, OUT_M0, OUT_MMIN, OUT_MMAX
 using .InversionSolver
 
@@ -56,29 +70,13 @@ const INVERSION_MAXITERS::Int = 25
 const INVERSION_LAMBDA_PRIOR::Float32 = 1.0f-2
 const INVERSION_LAMBDA_TV::Float32 = 1.0f-3
 const INVERSION_LAMBDA_BOUNDS::Float32 = 1.0f2
-
-# ── GPU (optional) ──────────────────────────────────────────────────────────
-
-function cuda_functional()::Bool
-    try
-        @eval import CUDA
-        return CUDA.functional()
-    catch
-        return false
-    end
-end
-
-function to_device(x, ::Val{true})
-    @eval import CUDA
-    return Lux.recursive_map(CUDA.cu, x)
-end
-to_device(x, ::Val{false}) = x
+const INFER_BATCH_SIZE::Int = 4
 
 # ── Dataset helpers ─────────────────────────────────────────────────────────
 
 function load_grid_from_h5(path::AbstractString)::InvGridSpecs.GridSpec
     h5open(path, "r") do f
-        a = attributes(f)
+        a = HDF5.attributes(f)
         return InvGridSpecs.GridSpec(
             Float32(read(a["xmin"])), Float32(read(a["xmax"])),
             Float32(read(a["ymin"])), Float32(read(a["ymax"])),
@@ -176,7 +174,7 @@ function _read_patch_input!(dataset::HDF5.Dataset,
                             i0::Int, j0::Int, k0::Int,
                             px::Int, py::Int, pz::Int, nc::Int,
                             raw::Array{Float32,4},
-                            out::Array{Float32,4})
+                            out::AbstractArray{Float32,4})
     nx, ny, nz, _ = size(dataset)
     i1 = min(i0 + px - 1, nx)
     j1 = min(j0 + py - 1, ny)
@@ -225,38 +223,60 @@ function infer_prior_tiled(model::UnifiedPriorUNet3D, ps, st,
         covered = falses(nx, ny, nz)
 
         raw = Array{Float32,4}(undef, px, py, pz, nc)
-        x_patch = Array{Float32,4}(undef, px, py, pz, in_channels)
-        x5 = Array{Float32,5}(undef, px, py, pz, in_channels, 1)
+        batch_size = use_gpu ? INFER_BATCH_SIZE : 1
+        x5_batch = Array{Float32,5}(undef, px, py, pz, in_channels, batch_size)
+        batch_meta = NTuple{6,Int}[]
 
         i_starts = tile_origins(nx, px)
         j_starts = tile_origins(ny, py)
         k_starts = tile_origins(nz, pz)
         n_tiles = length(i_starts) * length(j_starts) * length(k_starts)
-        println("  Tiled inference: $(nx)×$(ny)×$(nz)  patch=($px,$py,$pz)  tiles=$n_tiles")
+        println("  Tiled inference: $(nx)×$(ny)×$(nz)  patch=($px,$py,$pz)  tiles=$n_tiles  batch=$batch_size")
+
+        function flush_batch!(n_in_batch::Int)
+            n_in_batch == 0 && return
+            x_slice = n_in_batch == batch_size ? x5_batch :
+                      x5_batch[:, :, :, :, 1:n_in_batch]
+            x_in = use_gpu ? to_device(x_slice, Val(true)) : x_slice
+            vol, st_out = gpu_forward(use_gpu) do
+                model(x_in, ps, st)
+            end
+            st = st_out
+            vol_cpu = use_gpu ? Array(vol) : vol
+
+            for b in 1:n_in_batch
+                i0, j0, k0, di, dj, dk = batch_meta[b]
+                i1 = i0 + di - 1
+                j1 = j0 + dj - 1
+                k1 = k0 + dk - 1
+                m0[i0:i1, j0:j1, k0:k1] .= vol_cpu[1:di, 1:dj, 1:dk, OUT_M0, b]
+                m_min[i0:i1, j0:j1, k0:k1] .= vol_cpu[1:di, 1:dj, 1:dk, OUT_MMIN, b]
+                m_max[i0:i1, j0:j1, k0:k1] .= vol_cpu[1:di, 1:dj, 1:dk, OUT_MMAX, b]
+                covered[i0:i1, j0:j1, k0:k1] .= true
+            end
+            empty!(batch_meta)
+        end
 
         tile = 0
+        batch_n = 0
         t_start = time()
         for i0 in i_starts, j0 in j_starts, k0 in k_starts
             tile += 1
+            batch_n += 1
+            x_patch = view(x5_batch, :, :, :, :, batch_n)
             di, dj, dk = _read_patch_input!(dataset, i0, j0, k0, px, py, pz, nc, raw, x_patch)
-            x5[:, :, :, :, 1] = x_patch
-            x_in = use_gpu ? to_device(x5, Val(true)) : x5
-            vol, st = model(x_in, ps, st)
+            push!(batch_meta, (i0, j0, k0, di, dj, dk))
 
-            vol_cpu = use_gpu ? Array(vol) : vol
-            i1 = i0 + di - 1
-            j1 = j0 + dj - 1
-            k1 = k0 + dk - 1
-
-            m0[i0:i1, j0:j1, k0:k1] .= vol_cpu[1:di, 1:dj, 1:dk, OUT_M0, 1]
-            m_min[i0:i1, j0:j1, k0:k1] .= vol_cpu[1:di, 1:dj, 1:dk, OUT_MMIN, 1]
-            m_max[i0:i1, j0:j1, k0:k1] .= vol_cpu[1:di, 1:dj, 1:dk, OUT_MMAX, 1]
-            covered[i0:i1, j0:j1, k0:k1] .= true
+            if batch_n == batch_size
+                flush_batch!(batch_n)
+                batch_n = 0
+            end
 
             tile % max(1, n_tiles ÷ 10) == 0 &&
                 @printf("    tile %d/%d  origin=(%d,%d,%d)  elapsed=%.1fs\n",
                         tile, n_tiles, i0, j0, k0, time() - t_start)
         end
+        flush_batch!(batch_n)
 
         n_cov = count(covered)
         n_tot = nx * ny * nz
@@ -383,7 +403,7 @@ function save_results_h5(path::AbstractString;
         write(f, "history/prior", history.prior)
         write(f, "history/tv", history.tv)
         write(f, "history/bounds", history.bounds)
-        attrs = attributes(f)
+        attrs = HDF5.attributes(f)
         attrs["units/density"] = "g/cm3"
         attrs["units/gravity_misfit"] = "mGal2"
         for (k, v) in pairs(run_params)
@@ -402,13 +422,16 @@ end
 
 function run_pipeline()
     pipeline_start = time()
-    use_gpu = cuda_functional()
+    use_gpu = cuda_available(verbose=true)
+    if !use_gpu
+        cuda_diagnostics()
+    end
 
     println("═══════════════════════════════════════════════════════════════")
     println(" Smart Prior + Physics Inversion Pipeline")
     println(" Preprocessed data: $PREPROCESSED_H5")
     println(" Model checkpoint:    $MODEL_CHECKPOINT")
-    println(use_gpu ? "  Device: CUDA GPU" : "  Device: CPU")
+    println("  Device: ", device_label(use_gpu))
     println("═══════════════════════════════════════════════════════════════")
 
     isfile(PREPROCESSED_H5) ||

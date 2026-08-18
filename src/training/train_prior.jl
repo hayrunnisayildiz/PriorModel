@@ -8,10 +8,21 @@ Combined loss:
 Usage (from project root):
     julia --project=. src/training/train_prior.jl
     julia --project=. src/training/train_prior.jl --epochs 50 --dataset data/processed/keivitsa_preprocessed.h5
+
+Colab (cwd is /content — do not use --project=. from there):
+    julia --project=/content/PriorModel /content/PriorModel/src/training/train_prior.jl
 =#
 
 using Pkg
-Pkg.activate(joinpath(@__DIR__, "..", ".."))
+include(joinpath(@__DIR__, "..", "..", "src", "pkg_setup.jl"))
+activate_project!(joinpath(@__DIR__, "..", ".."))
+
+# Load LuxCUDA (CUDA + cuDNN) before Lux network includes (Julia 1.12 world-age).
+try
+    using LuxCUDA
+catch err
+    @info "LuxCUDA unavailable; training will use CPU" exception=err project=Base.active_project()
+end
 
 using Random
 using Printf
@@ -24,6 +35,8 @@ using Optimisers
 
 const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 
+include(joinpath(ROOT, "src", "gpu_utils.jl"))
+GPUUtils.init_cuda!()
 include(joinpath(ROOT, "src", "fusion", "GridSpec.jl"))
 include(joinpath(ROOT, "src", "data", "patch_loader.jl"))
 include(joinpath(ROOT, "src", "networks", "prior_unet3d.jl"))
@@ -31,6 +44,7 @@ include(joinpath(ROOT, "src", "physics_inversion", "ForwardGravity.jl"))
 include(joinpath(ROOT, "src", "neural_prior", "Losses.jl"))
 include(joinpath(ROOT, "src", "training", "PriorTrainingLoss.jl"))
 
+using .GPUUtils: cuda_available, to_device, device_label, cuda_diagnostics, gpu_forward
 using .PatchLoader: PatchSampler, PatchBatch, close
 using .PriorUNet3DLayers: UnifiedPriorUNet3D
 using .ForwardGravity: gravity_kernel_matrix
@@ -53,34 +67,13 @@ const DEFAULT_DATASET = joinpath(ROOT, "data", "processed", "keivitsa_preprocess
 const DEFAULT_MODEL_OUT = joinpath(ROOT, "models", "best_prior_model.jld2")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GPU helpers (optional CUDA)
-# ─────────────────────────────────────────────────────────────────────────────
-
-"""Return `true` when CUDA is loaded and a functional device is available."""
-function cuda_functional()::Bool
-    try
-        @eval import CUDA
-        return CUDA.functional()
-    catch
-        return false
-    end
-end
-
-"""Move arrays (and nested parameter trees) to GPU when requested."""
-function to_device(x, ::Val{true})
-    @eval import CUDA
-    return Lux.recursive_map(CUDA.cu, x)
-end
-to_device(x, ::Val{false}) = x
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Dataset discovery
 # ─────────────────────────────────────────────────────────────────────────────
 
 """Load grid metadata stored as HDF5 root attributes."""
 function load_grid_from_h5(path::AbstractString)::GridSpec
     h5open(path, "r") do f
-        a = attributes(f)
+        a = HDF5.attributes(f)
         return GridSpec(
             Float32(read(a["xmin"])), Float32(read(a["xmax"])),
             Float32(read(a["ymin"])), Float32(read(a["ymax"])),
@@ -233,13 +226,17 @@ function train_step!(model::UnifiedPriorUNet3D, ps, st, opt_state,
     x = to_device(batch.data, Val(use_gpu))
 
     loss_and_grad = Zygote.withgradient(ps) do p
-        vol, _ = model(x, p, st)
-        patch_combined_loss_terms(vol, x, batch.origins, ctx;
-                                  λ_well=λ_well, λ_grav=λ_grav,
-                                  λ_tv=λ_tv, λ_bounds=λ_bounds).total
+        gpu_forward(use_gpu) do
+            vol, _ = model(x, p, st)
+            patch_combined_loss_terms(vol, x, batch.origins, ctx;
+                                      λ_well=λ_well, λ_grav=λ_grav,
+                                      λ_tv=λ_tv, λ_bounds=λ_bounds).total
+        end
     end
 
-    vol, st_new = model(x, ps, st)
+    vol, st_new = gpu_forward(use_gpu) do
+        model(x, ps, st)
+    end
     terms = patch_combined_loss_terms(vol, x, batch.origins, ctx;
                                       λ_well=λ_well, λ_grav=λ_grav,
                                       λ_tv=λ_tv, λ_bounds=λ_bounds)
@@ -264,12 +261,15 @@ end
 
 function main(cfg::TrainConfig=TrainConfig())
     rng = MersenneTwister(cfg.seed)
-    use_gpu = cuda_functional()
+    use_gpu = cuda_available(verbose=true)
+    if !use_gpu
+        cuda_diagnostics()
+    end
 
     println("═" ^ 60)
     println(" Patch-based UnifiedPriorUNet3D training")
     println("═" ^ 60)
-    println(use_gpu ? "  Device: CUDA GPU" : "  Device: CPU")
+    println("  Device: ", device_label(use_gpu))
 
     dataset_key, vol_shape = resolve_dataset_key(cfg.dataset; preferred=cfg.dataset_key)
     nc = vol_shape[4]
