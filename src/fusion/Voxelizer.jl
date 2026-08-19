@@ -8,8 +8,9 @@ Reads 1D borehole tables (GTK ` ^ `-delimited TXT mirrors of shapefiles) and
 voxel grid as a column-major `Array{Float32,4}` of shape `(X, Y, Z, C)`.
 
 Interpolation:
-- 3D borehole assays / petrophysics: inverse-distance weighting (IDW) splat
-- 2D surface potentials: `NearestNeighbors.KDTree` + IDW in `(X, Y)`, then
+- 3D borehole assays / density: inverse-distance weighting (IDW) splat
+- 3D borehole resistivity (`LUO_R`): nearest-voxel splat (sparse well hits)
+- 2D surface EM/IP: `NearestNeighbors.KDTree` + IDW in `(X, Y)`, then
   exponential vertical decay into depth
 - Lithology: nearest-cell categorical codes (not IDW)
 
@@ -32,8 +33,16 @@ using .GridSpecs
 
 export GridSpec, load_gridspec, load_config, nx, ny, nz, nxyz, grid_size
 export borehole_to_grid, surface_to_grid, build_fusion_tensor
-export fusion_channel_names
+export fusion_channel_names, EM_PRIOR_CHANNEL_NAMES
 export read_gtk_txt, read_gtk_xyz
+export RESISTIVITY_CHANNEL, VLF_RESISTIVITY_CHANNEL, SLINGRAM_REAL_CHANNEL, IP_CHARGEABILITY_CHANNEL
+
+# 1-based indices matching `tensor_channels` in config/dataset_config.yaml
+const RESISTIVITY_CHANNEL::Int = 1
+const VLF_RESISTIVITY_CHANNEL::Int = 2
+const SLINGRAM_REAL_CHANNEL::Int = 3
+const IP_CHARGEABILITY_CHANNEL::Int = 4
+const EM_PRIOR_CHANNEL_NAMES = ("resistivity", "vlf_resistivity", "slingram_real", "ip_chargeability")
 
 const FILL::Float32 = NaN32
 const P2 = SVector{2,Float32}
@@ -830,6 +839,52 @@ function _load_density_points(root::AbstractString, cfg::AbstractDict,
 end
 
 """
+    _load_resistivity_points(root, cfg, ctx) -> (px, py, pz, pv)
+
+Read sondaj petrophysics resistivity `LUO_R` and desurvey along the hole.
+
+# Units
+`pv`: ohm·m (positive finite samples only).
+"""
+function _load_resistivity_points(root::AbstractString, cfg::AbstractDict,
+                                 ctx::BoreholeContext)
+    petro_yaml = cfg["borehole"]["petrophysics"]["path"]
+    path = resolve_table_path(root, string(petro_yaml))
+    df = read_gtk_txt(path)
+    idc = find_column(df, ["Tunnus", "HOLE_ID"])
+    depc = find_column(df, ["Syvyys", "DEPTH"])
+    col_hint = nothing
+    petro = get(cfg["borehole"], "petrophysics", nothing)
+    if petro isa AbstractDict
+        cols = get(petro, "columns", nothing)
+        if cols isa AbstractDict
+            res = get(cols, "resistivity", nothing)
+            if res isa AbstractDict
+                col_hint = string(get(res, "name", "LUO_R"))
+            end
+        end
+    end
+    candidates = String[]
+    col_hint !== nothing && push!(candidates, col_hint)
+    append!(candidates, ["LUO_R", "Luo_R", "RES", "R"])
+    resc = find_column(df, unique(candidates))
+    (idc === nothing || depc === nothing) && error("Petrophysics missing Tunnus/Syvyys")
+    resc === nothing && error("Petrophysics missing LUO_R resistivity column")
+
+    ids = col_str(df, idc)
+    deps = col_f32(df, depc)
+    res = col_f32(df, resc)
+    px = Float32[]; py = Float32[]; pz = Float32[]; pv = Float32[]
+    @inbounds for i in eachindex(ids)
+        v = res[i]
+        (isnan(v) || v <= 0) && continue
+        _push_desurveyed!(px, py, pz, pv, ctx, ids[i], deps[i], v)
+    end
+    @info "Resistivity points (LUO_R)" n=length(pv) unit="ohm.m" file=basename(path)
+    return px, py, pz, pv
+end
+
+"""
     _load_lithology_points(root, cfg, ctx, dz) -> (px, py, pz, pv)
 
 Sample lithology intervals (`kivit.txt`, `Kivilaji`) every `dz/2` metres along
@@ -893,8 +948,15 @@ function _fill_borehole_channel!(slice::AbstractArray{Float32,3},
         px, py, pz, pv = _load_assay_points(root, cfg, ctx, element)
         idw_splat_3d!(slice, grid, px, py, pz, pv; power=power, max_radius=max_radius)
     elseif source == "borehole.petrophysics"
-        px, py, pz, pv = _load_density_points(root, cfg, ctx)
-        idw_splat_3d!(slice, grid, px, py, pz, pv; power=power, max_radius=max_radius)
+        lname = lowercase(name)
+        if lname == "resistivity" || lname == "luo_r" || occursin("resist", lname)
+            px, py, pz, pv = _load_resistivity_points(root, cfg, ctx)
+            # Sparse nearest-voxel splat so well loss is true LUO_R, not 150 m IDW fill.
+            nearest_fill_3d!(slice, grid, px, py, pz, pv)
+        else
+            px, py, pz, pv = _load_density_points(root, cfg, ctx)
+            idw_splat_3d!(slice, grid, px, py, pz, pv; power=power, max_radius=max_radius)
+        end
     elseif source == "borehole.lithology"
         px, py, pz, pv = _load_lithology_points(root, cfg, ctx, grid.dz)
         nearest_fill_3d!(slice, grid, px, py, pz, pv)
@@ -1002,6 +1064,7 @@ function _channel_value_candidates(spec::AbstractDict, channel_name::AbstractStr
         "self_potential"   => ["SP"],
         "vlf_resistivity"  => ["ov", "OV"],
         "slingram_real"    => ["Re", "Re_pct", "Re%"],
+        "resistivity"      => ["LUO_R", "ov", "OV"],
     )
     haskey(extra, String(channel_name)) && append!(cand, extra[String(channel_name)])
     return unique(cand)
@@ -1089,8 +1152,8 @@ end
 """
     surface_to_grid(grid, config_path; k, power, max_radius, decay_length) -> Array{Float32,4}
 
-Map gravity / mag / IP / SP / VLF / slingram (and aero mag) onto the top of
-`grid` and continue them downward with `exp(-depth / λ)`.
+Map surface EM / IP surveys (VLF resistivity, Slingram real, IP chargeability)
+onto the top of `grid` and continue them downward with `exp(-depth / λ)`.
 
 # Arguments
 - `k`: KDTree neighbours (default 8)

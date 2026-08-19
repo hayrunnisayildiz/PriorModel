@@ -4,11 +4,15 @@
 Lux.jl 3-D U-Net prior generator with CBAM3D attention (`UnifiedPriorUNet3D`).
 
 # Tensor layout (column-major, `Float32`)
-- Input:  `(P_x, P_y, P_z, C_in, B)` — patch fusion volume from [`PatchLoader`](@ref)
+- Input:  `(P_x, P_y, P_z, C_in, B)` — EM/IP/resistivity patch from [`PatchLoader`](@ref)
+  (`resistivity`, `vlf_resistivity`, `slingram_real`, `ip_chargeability`, + validity mask)
 - Output: `(P_x, P_y, P_z, 3, B)` with
-  - channel 1: ``m_0`` — initial density prior, ``g/cm^3``, in ``[\\rho_{min}, \\rho_{max}]``
+  - channel 1: ``m_0`` — initial resistivity prior, ohm·m, in ``[\\rho_{min}, \\rho_{max}]``
   - channel 2: ``m_{min}`` — lower bound, ``m_{min} \\le m_0``
   - channel 3: ``m_{max}`` — upper bound, ``m_0 \\le m_{max}``
+
+The head predicts ``\\log_{10}\\rho`` then converts with ``10^{\\cdot}`` so the
+network trains in log space while the saved prior is in ohm·m.
 
 Explicit `ps` / `st` throughout; compatible with Zygote.jl, Optimisers.jl, and
 ComponentArrays.jl via `Lux.setup`.
@@ -78,10 +82,10 @@ function _crop_xyz(x::AbstractArray, target_x::Int, target_y::Int, target_z::Int
     return x[ox+1:ox+target_x, oy+1:oy+target_y, oz+1:oz+target_z, :, :]
 end
 
-function _scale_density(logits::AbstractArray{T},
-                        rho_min::Float32, rho_max::Float32) where {T}
-    lo = T(rho_min)
-    hi = T(rho_max)
+function _scale_log_resistivity(logits::AbstractArray{T},
+                                log_rho_min::Float32, log_rho_max::Float32) where {T}
+    lo = T(log_rho_min)
+    hi = T(log_rho_max)
     return lo .+ (hi - lo) .* sigmoid.(logits)
 end
 
@@ -230,13 +234,13 @@ end
 
 """
     UnifiedPriorUNet3D(;
-        in_channels=12,
+        in_channels=5,
         base_channels=16,
         reduction=4,
         spatial_kernel=3,
-        rho_min=1.8f0,
-        rho_max=4.0f0,
-        delta_max=0.40f0,
+        log_rho_min=-1.0f0,
+        log_rho_max=5.0f0,
+        delta_max=1.0f0,
         logit_scale=0.10f0,
     )
 
@@ -246,22 +250,24 @@ end
 2. **Bottleneck** — `DoubleConv3D → CBAM3D` at `4·base` channels.
 3. **Decoder (×2)** — `ConvTranspose3D` upsample, skip `cat(..., dims=4)`,
    `DoubleConv3D`.
-4. **Head** — `1×1×1` conv → ``m_0, m_{min}, m_{max}`` with geological
-   density bounds.
+4. **Head** — `1×1×1` conv → ``\\log_{10} m_0, \\delta_-, \\delta_+`` then
+   ``m = 10^{\\cdot}`` with geological resistivity bounds
+   ``[10^{\\mathrm{log\\_rho\\_min}}, 10^{\\mathrm{log\\_rho\\_max}}]`` ohm·m
+   (default 0.1 – 10⁵ Ω·m).
 
 # Forward
 `(model)(x, ps, st) -> (volume, st′)`
 
 - `x`: `(P_x, P_y, P_z, C_in, B)` or 4-D without batch
-- `volume`: `(P_x, P_y, P_z, 3, B)` — channels 1–3 = ``m_0, m_{min}, m_{max}``
+- `volume`: `(P_x, P_y, P_z, 3, B)` — channels 1–3 = ``m_0, m_{min}, m_{max}`` (ohm·m)
 """
 struct UnifiedPriorUNet3D{E1,E2,B,D1,D2,H} <: Lux.AbstractLuxContainerLayer{
     (:enc1, :enc2, :bottleneck, :dec1, :dec2, :head)
 }
     in_channels::Int
     base_channels::Int
-    rho_min::Float32
-    rho_max::Float32
+    log_rho_min::Float32
+    log_rho_max::Float32
     delta_max::Float32
     logit_scale::Float32
     enc1::E1
@@ -273,17 +279,17 @@ struct UnifiedPriorUNet3D{E1,E2,B,D1,D2,H} <: Lux.AbstractLuxContainerLayer{
 end
 
 function UnifiedPriorUNet3D(;
-                            in_channels::Int=12,
+                            in_channels::Int=5,
                             base_channels::Int=16,
                             reduction::Int=4,
                             spatial_kernel::Int=3,
-                            rho_min::Float32=1.8f0,
-                            rho_max::Float32=4.0f0,
-                            delta_max::Float32=0.40f0,
+                            log_rho_min::Float32=-1.0f0,
+                            log_rho_max::Float32=5.0f0,
+                            delta_max::Float32=1.0f0,
                             logit_scale::Float32=0.10f0)
     in_channels >= 1 || throw(ArgumentError("in_channels must be ≥ 1"))
     base_channels >= 4 || throw(ArgumentError("base_channels must be ≥ 4"))
-    rho_max > rho_min || throw(ArgumentError("rho_max must exceed rho_min"))
+    log_rho_max > log_rho_min || throw(ArgumentError("log_rho_max must exceed log_rho_min"))
     delta_max > 0 || throw(ArgumentError("delta_max must be positive"))
     logit_scale > 0 || throw(ArgumentError("logit_scale must be positive"))
 
@@ -305,7 +311,7 @@ function UnifiedPriorUNet3D(;
 
     return UnifiedPriorUNet3D{typeof(enc1),typeof(enc2),typeof(bottleneck),
                               typeof(dec1),typeof(dec2),typeof(head)}(
-        in_channels, base_channels, rho_min, rho_max, delta_max, logit_scale,
+        in_channels, base_channels, log_rho_min, log_rho_max, delta_max, logit_scale,
         enc1, enc2, bottleneck, dec1, dec2, head,
     )
 end
@@ -328,20 +334,24 @@ function (m::UnifiedPriorUNet3D)(x::AbstractArray, ps, st)
     h_dec, st_d1 = m.dec1(bot, skip0, ps.dec1, st.dec1)
     h_dec, st_d2 = m.dec2(h_dec, skip1, ps.dec2, st.dec2)
 
-    # ── Density prior head ───────────────────────────────────────────────────
+    # ── Log-resistivity prior head (ohm·m after 10^) ─────────────────────────
     logits, st_head = m.head(h_dec, ps.head, st.head)
 
     T = eltype(logits)
     s = T(m.logit_scale)
-    lo = T(m.rho_min)
-    hi = T(m.rho_max)
+    lo = T(m.log_rho_min)
+    hi = T(m.log_rho_max)
 
-    m0 = _scale_density(logits[:, :, :, 1:1, :] .* s, m.rho_min, m.rho_max)
+    log_m0 = _scale_log_resistivity(logits[:, :, :, 1:1, :] .* s,
+                                    m.log_rho_min, m.log_rho_max)
     δ = T(m.delta_max) .* sigmoid.(logits[:, :, :, 2:3, :] .* s)
     δ_lo = δ[:, :, :, 1:1, :]
     δ_hi = δ[:, :, :, 2:2, :]
-    m_min = _clip(m0 .- δ_lo, lo, hi)
-    m_max = _clip(m0 .+ δ_hi, lo, hi)
+    log_min = _clip(log_m0 .- δ_lo, lo, hi)
+    log_max = _clip(log_m0 .+ δ_hi, lo, hi)
+    m0 = exp10.(log_m0)
+    m_min = exp10.(log_min)
+    m_max = exp10.(log_max)
     volume = cat(m0, m_min, m_max; dims=4)
 
     st_new = (;
@@ -359,14 +369,14 @@ function Base.show(io::IO, m::UnifiedPriorUNet3D)
     c = m.base_channels
     print(io, "UnifiedPriorUNet3D(C_in=", m.in_channels,
           ", base=", c, "→", 2c, "→", 4c,
-          ", ρ∈[", m.rho_min, ",", m.rho_max, "] g/cm³)")
+          ", ρ∈[", exp10(m.log_rho_min), ",", exp10(m.log_rho_max), "] Ω·m)")
 end
 
 """
     generate_prior(model, x, ps, st) -> (volume, st′)
 
 Convenience wrapper.  Returns `(P_x, P_y, P_z, 3[, B])` with
-``m_0, m_{min}, m_{max}`` in ``g/cm^3``.
+``m_0, m_{min}, m_{max}`` in ohm·m.
 """
 function generate_prior(model::UnifiedPriorUNet3D, x::AbstractArray, ps, st)
     volume, st_new = model(x, ps, st)
@@ -384,7 +394,7 @@ Forward pass on a random patch batch; returns `true` when all checks pass.
 """
 function run_smoke_test(;
                         px::Int=32, py::Int=32, pz::Int=16,
-                        in_channels::Int=12, batch_size::Int=2,
+                        in_channels::Int=5, batch_size::Int=2,
                         base_channels::Int=16,
                         rng::AbstractRNG=Random.default_rng())::Bool
     model = UnifiedPriorUNet3D(; in_channels, base_channels)
@@ -402,8 +412,10 @@ function run_smoke_test(;
     m_max = volume[:, :, :, 3, :]
     all(m_min .<= m0 .+ 1.0f-5) || error("m_min > m0 violation")
     all(m0 .<= m_max .+ 1.0f-5) || error("m0 > m_max violation")
-    all(m0 .>= model.rho_min .- 1.0f-5) || error("m0 below rho_min")
-    all(m0 .<= model.rho_max .+ 1.0f-5) || error("m0 above rho_max")
+    rho_lo = exp10(model.log_rho_min)
+    rho_hi = exp10(model.log_rho_max)
+    all(m0 .>= rho_lo * 0.999f0) || error("m0 below ρ_min")
+    all(m0 .<= rho_hi * 1.001f0) || error("m0 above ρ_max")
 
     return true
 end

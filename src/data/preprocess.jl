@@ -6,10 +6,13 @@ Geophysical + borehole preprocessing for the Smart Prior deep-learning pipeline.
 Reads GTK `.xyz` / `.XYZ` surface surveys and collar / survey / petrophysics
 tables, then produces training-ready tensors:
 
-- **Input `X`**: `(N_x, N_y, C_in)` multi-channel surface anomaly maps
-  (gravity, magnetic, EM/IP, …) on the active [`GridSpec`](@ref).
+- **Input `X`**: `(N_x, N_y, C_in)` surface EM/IP maps
+  (`vlf_resistivity`, `slingram_real`, `ip_chargeability`) on the active
+  [`GridSpec`](@ref).
 - **Target `Y`**: `(N_x, N_y, N_z, C_out)` subsurface volume with borehole
-  petrophysics (`density`, `LUO_R`) and a well-path mask `M_sondaj`.
+  resistivity (`LUO_R`) and a well-path mask `M_sondaj`.
+- **Fusion**: `(N_x, N_y, N_z, 4)` volume used by `UnifiedPriorUNet3D`
+  (`resistivity`, `vlf_resistivity`, `slingram_real`, `ip_chargeability`).
 
 Surface workflow per channel:
 1. Clip `(X, Y)` to the grid bounding box
@@ -18,10 +21,18 @@ Surface workflow per channel:
 
 Borehole workflow:
 1. Merge collar + survey → 3-D trajectory (balanced tangential desurvey)
-2. Assign `DSR_D` / `PTR_D` and `LUO_R` at traversed voxels
+2. Assign `LUO_R` resistivity at traversed voxels
 3. Build binary mask along the hole path
 
 Persist with HDF5 (default) or JLD2; iterate mini-batches via [`PatchDataLoader`](@ref).
+
+# Example
+```julia
+include("src/data/preprocess.jl")
+using .DataPreprocess
+ds = preprocess("config/dataset_config.yaml")
+save_dataset("data/processed/keivitsa_preprocessed.h5", ds)
+```
 """
 module DataPreprocess
 
@@ -53,8 +64,8 @@ export surface_channel_table, iterate, n_batches
 const FILL = Voxelizer.FILL
 const P2 = SVector{2,Float32}
 
-"""Default output channels for `Y`: density, resistivity, well mask."""
-const TARGET_NAMES = ("density", "resistivity", "M_sondaj")
+"""Default output channels for `Y`: borehole resistivity (`LUO_R`) and well mask."""
+const TARGET_NAMES = ("resistivity", "M_sondaj")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Options & dataset container
@@ -91,17 +102,20 @@ end
 """
     PreprocessedDataset
 
-- `X`: `(N_x, N_y, C_in)` surface inputs (`Float32`, off-grid / empty → `NaN32`)
-- `Y`: `(N_x, N_y, N_z, C_out)` targets (`Float32`; channels 1–2 petrophysics, 3 mask)
+- `X`: `(N_x, N_y, C_in)` surface EM/IP inputs (`Float32`, off-grid / empty → `NaN32`)
+- `Y`: `(N_x, N_y, N_z, C_out)` targets (`Float32`; channel 1 = `LUO_R` ohm·m, 2 = mask)
+- `fusion`: `(N_x, N_y, N_z, C_em)` 3-D EM prior tensor (`NaN32` empty cells)
 - `grid`: active [`GridSpec`](@ref)
-- `input_names`, `target_names`: channel labels
+- `input_names`, `target_names`, `fusion_names`: channel labels
 """
 struct PreprocessedDataset
     X::Array{Float32,3}
     Y::Array{Float32,4}
+    fusion::Array{Float32,4}
     grid::GridSpec
     input_names::Vector{String}
     target_names::Vector{String}
+    fusion_names::Vector{String}
     meta::Dict{String,Any}
 end
 
@@ -342,7 +356,7 @@ end
 # Borehole target  Y  : (Nx, Ny, Nz, Cout)
 # ─────────────────────────────────────────────────────────────────────────────
 
-"""Read petrophysics table and return desurveyed `(px,py,pz,p_density,p_resist)`."""
+"""Read petrophysics table and return desurveyed `(px,py,pz,p_resist)`."""
 function _load_petrophysics_desurveyed(root::AbstractString, cfg::AbstractDict,
                                        ctx::Voxelizer.BoreholeContext)
     petro_yaml = cfg["borehole"]["petrophysics"]["path"]
@@ -351,33 +365,27 @@ function _load_petrophysics_desurveyed(root::AbstractString, cfg::AbstractDict,
 
     idc = Voxelizer.find_column(df, ["Tunnus", "HOLE_ID"])
     depc = Voxelizer.find_column(df, ["Syvyys", "DEPTH"])
-    dsrc = Voxelizer.find_column(df, ["DSR_D"])
-    ptrc = Voxelizer.find_column(df, ["PTR_D"])
     resc = Voxelizer.find_column(df, ["LUO_R"])
     (idc === nothing || depc === nothing) && error("Petrophysics missing Tunnus/Syvyys")
-    (dsrc === nothing && ptrc === nothing) && error("Petrophysics missing DSR_D/PTR_D")
     resc === nothing && @warn "LUO_R column not found; resistivity channel stays empty"
 
     ids = Voxelizer.col_str(df, idc)
     deps = Voxelizer.col_f32(df, depc)
-    dsr = dsrc === nothing ? fill(FILL, length(ids)) : Voxelizer.col_f32(df, dsrc)
-    ptr = ptrc === nothing ? fill(FILL, length(ids)) : Voxelizer.col_f32(df, ptrc)
     res = resc === nothing ? fill(FILL, length(ids)) : Voxelizer.col_f32(df, resc)
 
     px = Float32[]; py = Float32[]; pz = Float32[]
-    pd = Float32[]; pr = Float32[]
+    pr = Float32[]
     @inbounds for i in eachindex(ids)
         hid = ids[i]
         (isempty(hid) || isnan(deps[i]) || !haskey(ctx.collars, hid)) && continue
-        dens = isnan(dsr[i]) ? ptr[i] : dsr[i]
-        (isnan(dens) && isnan(res[i])) && continue
+        (isnan(res[i]) || res[i] <= 0) && continue
         x, y, z = Voxelizer.desurvey_md(ctx.collars[hid],
                                         Voxelizer._stations(ctx, hid), deps[i])
         push!(px, x); push!(py, y); push!(pz, z)
-        push!(pd, dens); push!(pr, res[i])
+        push!(pr, res[i])
     end
-    @info "Petrophysics desurveyed" n=length(px) file=basename(path)
-    return px, py, pz, pd, pr
+    @info "Petrophysics resistivity desurveyed" n=length(px) file=basename(path)
+    return px, py, pz, pr
 end
 
 """Mark voxels along every surveyed hole (for the well mask)."""
@@ -407,32 +415,28 @@ function _rasterize_trajectory_mask!(mask::Array{Float32,3}, grid::GridSpec,
     return mask
 end
 
-"""Splat petrophysics samples into nearest voxels (last finite write wins)."""
-function _splat_petrophysics!(density::Array{Float32,3}, resistivity::Array{Float32,3},
-                              mask::Array{Float32,3}, grid::GridSpec,
-                              px, py, pz, pd, pr)
-    nxx, nyy, nzz = size(density)
+"""Splat LUO_R samples into nearest voxels (last finite write wins)."""
+function _splat_resistivity!(resistivity::Array{Float32,3},
+                             mask::Array{Float32,3}, grid::GridSpec,
+                             px, py, pz, pr)
+    nxx, nyy, nzz = size(resistivity)
     @inbounds for p in eachindex(px)
         (isnan(px[p]) || isnan(py[p]) || isnan(pz[p])) && continue
         i, j, k = GridSpecs.coord_to_index(grid, px[p], py[p], pz[p])
         (1 <= i <= nxx && 1 <= j <= nyy && 1 <= k <= nzz) || continue
-        if isfinite(pd[p])
-            density[i, j, k] = pd[p]
-            mask[i, j, k] = 1.0f0
-        end
-        if isfinite(pr[p])
+        if isfinite(pr[p]) && pr[p] > 0
             resistivity[i, j, k] = pr[p]
             mask[i, j, k] = 1.0f0
         end
     end
-    return density, resistivity, mask
+    return resistivity, mask
 end
 
 """
     build_borehole_target(grid, config_path, opts) -> Y
 
-`(N_x, N_y, N_z, 3)` volume: `[density, LUO_R, M_sondaj]`.
-Empty cells → `NaN32` (petrophysics) or `0` (mask).
+`(N_x, N_y, N_z, 2)` volume: `[LUO_R, M_sondaj]`.
+Empty cells → `NaN32` (resistivity) or `0` (mask).
 """
 function build_borehole_target(grid::GridSpec, config_path::AbstractString,
                                opts::PreprocessOptions=PreprocessOptions())
@@ -440,16 +444,15 @@ function build_borehole_target(grid::GridSpec, config_path::AbstractString,
     root = GridSpecs.project_root(GridSpecs.resolve_config_path(config_path))
     nxx, nyy, nzz = GridSpecs.nxyz(grid)
 
-    density = fill(FILL, nxx, nyy, nzz)
     resistivity = fill(FILL, nxx, nyy, nzz)
     mask = zeros(Float32, nxx, nyy, nzz)
 
     ctx = Voxelizer.load_borehole_context(root, cfg)
-    px, py, pz, pd, pr = _load_petrophysics_desurveyed(root, cfg, ctx)
-    _splat_petrophysics!(density, resistivity, mask, grid, px, py, pz, pd, pr)
+    px, py, pz, pr = _load_petrophysics_desurveyed(root, cfg, ctx)
+    _splat_resistivity!(resistivity, mask, grid, px, py, pz, pr)
     _rasterize_trajectory_mask!(mask, grid, ctx, opts.trajectory_step)
 
-    Y = cat(density, resistivity, mask; dims=4)
+    Y = cat(resistivity, mask; dims=4)
     return Y
 end
 
@@ -469,14 +472,18 @@ function preprocess(config_path::AbstractString;
     cfg = GridSpecs.load_config(config_path)
     X, in_names = build_surface_tensor(grid, config_path, opts)
     Y = build_borehole_target(grid, config_path, opts)
+    fusion = Voxelizer.build_fusion_tensor(grid, config_path)
+    fusion_names = Voxelizer.fusion_channel_names(config_path)
     meta = Dict{String,Any}(
         "config_path" => abspath(GridSpecs.resolve_config_path(config_path)),
         "grid_block" => block === nothing ? Voxelizer.active_grid_name(cfg) : string(block),
         "interp_method" => string(opts.interp_method),
         "outlier_method" => string(opts.outlier_method),
         "epsg" => grid.epsg_code,
+        "prior_domain" => "resistivity",
     )
-    return PreprocessedDataset(X, Y, grid, in_names, target_channel_names(), meta)
+    return PreprocessedDataset(X, Y, fusion, grid, in_names, target_channel_names(),
+                               fusion_names, meta)
 end
 
 """In-place alias for [`preprocess`](@ref)."""
@@ -520,19 +527,23 @@ function save_dataset(path::AbstractString, ds::PreprocessedDataset;
         h5open(path, "w") do f
             write(f, "X", ds.X)
             write(f, "Y", ds.Y)
+            write(f, "fusion", ds.fusion)
             _write_grid_attrs(f, ds.grid)
             attrs = attributes(f)
             attrs["input_channel_names"] = ds.input_names
             attrs["target_channel_names"] = ds.target_names
+            attrs["fusion_channel_names"] = ds.fusion_names
+            attrs["prior_domain"] = "resistivity"
+            attrs["units/resistivity"] = "ohm.m"
             for (k, v) in ds.meta
                 attrs["meta/" * k] = v
             end
         end
     elseif fmt == :jld2
         jldsave(path;
-                X=ds.X, Y=ds.Y, grid=ds.grid,
+                X=ds.X, Y=ds.Y, fusion=ds.fusion, grid=ds.grid,
                 input_names=ds.input_names, target_names=ds.target_names,
-                meta=ds.meta)
+                fusion_names=ds.fusion_names, meta=ds.meta)
     else
         error("Unknown format=$(repr(format)); use :h5 or :jld2")
     end
@@ -561,22 +572,34 @@ function load_dataset(path::AbstractString)::PreprocessedDataset
             )
             in_names = Vector{String}(read(attrs["input_channel_names"]))
             tgt_names = Vector{String}(read(attrs["target_channel_names"]))
+            fusion = haskey(f, "fusion") ? read(f, "fusion") : Y
+            fusion_names = if haskey(attrs, "fusion_channel_names")
+                Vector{String}(read(attrs["fusion_channel_names"]))
+            else
+                in_names
+            end
             meta = Dict{String,Any}()
             for k in keys(attrs)
                 sk = string(k)
                 startswith(sk, "meta/") && (meta[sk[6:end]] = read(attrs[k]))
             end
-            return PreprocessedDataset(X, Y, grid, in_names, tgt_names, meta)
+            return PreprocessedDataset(X, Y, fusion, grid, in_names, tgt_names,
+                                       fusion_names, meta)
         end
     elseif ext == ".jld2"
         data = jldopen(path, "r") do file
-            (; X=read(file, "X"), Y=read(file, "Y"), grid=read(file, "grid"),
+            (; X=read(file, "X"), Y=read(file, "Y"),
+               fusion=haskey(file, "fusion") ? read(file, "fusion") : read(file, "Y"),
+               grid=read(file, "grid"),
                input_names=read(file, "input_names"), target_names=read(file, "target_names"),
+               fusion_names=haskey(file, "fusion_names") ? read(file, "fusion_names") :
+                            read(file, "input_names"),
                meta=haskey(file, "meta") ? read(file, "meta") : Dict{String,Any}())
         end
-        return PreprocessedDataset(data.X, data.Y, data.grid,
+        return PreprocessedDataset(data.X, data.Y, data.fusion, data.grid,
                                    Vector{String}(data.input_names),
                                    Vector{String}(data.target_names),
+                                   Vector{String}(data.fusion_names),
                                    data.meta)
     else
         error("Unsupported dataset extension $(ext); use .h5 or .jld2")

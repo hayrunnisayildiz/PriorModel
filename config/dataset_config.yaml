@@ -289,16 +289,9 @@ auxiliary:
 
 # ── Tensor channel mapping (for Lux prior network) ────────────────────────
 tensor_channels:
-  # Maps to (X, Y, Z, C, B) layout per .cursorrules
-  # v1 subset — extend with maxmin, lp, vlf_phase, aero EM/radiometry as needed
-  - { id: 0,  source: ground_geophysics.gravimetric,  name: gravity,        unit: mGal }
-  - { id: 1,  source: ground_geophysics.magnetic,    name: magnetic_tmi,   unit: nT }
-  - { id: 2,  source: aero_geophysics.magnetic,      name: aero_magnetic,  unit: nT }
-  - { id: 3,  source: ground_geophysics.ip,          name: ip_chargeability, unit: mV/V }
-  - { id: 4,  source: ground_geophysics.sp,          name: self_potential, unit: mV }
-  - { id: 5,  source: ground_geophysics.vlf,         name: vlf_resistivity, unit: ohm.m }
-  - { id: 6,  source: ground_geophysics.slingram,    name: slingram_real,  unit: percent }
-  - { id: 7,  source: borehole.assay,                name: cu_ppm,         unit: ppm, element: CU }
-  - { id: 8,  source: borehole.assay,                name: ni_ppm,         unit: ppm, element: NI }
-  - { id: 9,  source: borehole.petrophysics,         name: density,        unit: kg/m3 }
-  - { id: 10, source: borehole.lithology,            name: rocktype,       unit: categorical }
+  # EM / IP / resistivity smart-prior subset (X, Y, Z, C)
+  # UnifiedPriorUNet3D maps these (+ PatchLoader validity mask) → 3-D resistivity prior.
+  - { id: 0, source: borehole.petrophysics,      name: resistivity,     unit: ohm.m, column: LUO_R }
+  - { id: 1, source: ground_geophysics.vlf,      name: vlf_resistivity,  unit: ohm.m }
+  - { id: 2, source: ground_geophysics.slingram, name: slingram_real,    unit: percent }
+  - { id: 3, source: ground_geophysics.ip,       name: ip_chargeability, unit: mV/V }

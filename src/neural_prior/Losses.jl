@@ -3,27 +3,28 @@
 
 Prior-fitting losses for [`PriorNet3D.SmartPriorNet3D`](@ref).
 
-The data term is evaluated only at known borehole density voxels (a boolean
+The data term is evaluated only at known borehole resistivity voxels (a boolean
 or 0/1 mask). Spatial continuity is an anisotropic 3-D total variation (TV)
-regulariser on ``m_0``.
+regulariser on ``\\log_{10} m_0``.
 
 All reductions return a scalar `eltype(m0)` so the objective is drop-in
 compatible with Zygote.jl and Optimization.jl.
 
 # Units
-- `m0`, `target`: ``g/cm^3``
-- Fusion-tensor density (channel 10) is ``kg/m^3``; use
-  [`extract_density_target`](@ref) to convert and build the mask
+- `m0`, `target`: ohm·m (log-space comparison recommended)
+- Fusion-tensor resistivity (channel 1) is ohm·m; use
+  [`extract_resistivity_target`](@ref) to build the mask
 """
 module Losses
 
 using Statistics: mean
 
 export smooth_l1, masked_data_loss, total_variation
-export prior_loss, prior_loss_terms, extract_density_target
-export KG_M3_TO_G_CM3, DENSITY_CHANNEL
+export prior_loss, prior_loss_terms, extract_density_target, extract_resistivity_target
+export KG_M3_TO_G_CM3, DENSITY_CHANNEL, RESISTIVITY_CHANNEL
 
-const DENSITY_CHANNEL::Int = 10
+const RESISTIVITY_CHANNEL::Int = 1
+const DENSITY_CHANNEL::Int = RESISTIVITY_CHANNEL
 const KG_M3_TO_G_CM3::Float32 = 0.001f0
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,10 +90,10 @@ end
 Mean regression loss on voxels where `mask > 0`.
 
 # Arguments
-- `pred`, `target`: density, ``g/cm^3``, broadcastable to `(X, Y, Z, 1, B)`
+- `pred`, `target`: resistivity, ohm·m, broadcastable to `(X, Y, Z, 1, B)`
 - `mask`: `Bool` or `{0,1}` at known borehole cells
 - `kind`: `:smooth_l1` (default) or `:l2` (mean squared error / 2)
-- `β`: Huber threshold, ``g/cm^3`` (ignored for `:l2`)
+- `β`: Huber threshold (ignored for `:l2`)
 
 # Returns
 Scalar `eltype(pred)`.
@@ -168,10 +169,10 @@ end
 ``L = L_{data} + λ_{tv}\\, TV(m_0) [+ λ_{bounds} L_{box}]``.
 
 # Arguments
-- `m0`: predicted ``m_0``, ``g/cm^3``, `(X, Y, Z, 1[, B])`
-- `target`: borehole density, ``g/cm^3``, same spatial size
+- `m0`: predicted ``m_0``, ohm·m, `(X, Y, Z, 1[, B])`
+- `target`: borehole resistivity, ohm·m, same spatial size
 - `mask`: known-cell mask (finite petrophysics voxels)
-- `λ_tv`: TV weight (dimensionless relative to ``g/cm^3`` data loss)
+- `λ_tv`: TV weight (dimensionless relative to data loss)
 - `bounds`: optional `(X, Y, Z, 2[, B])` with ``m_{min}, m_{max}``; if given
   and `λ_bounds > 0`, a hinge penalises ``m_0 \\notin [m_{min}, m_{max}]``
   and ``m_{min} > m_{max}``
@@ -236,37 +237,36 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
-    extract_density_target(tensor; channel=10, from_unit=:kg_m3)
+    extract_resistivity_target(tensor; channel=1)
         -> (target, mask)
 
-Pull the borehole density channel out of a fusion volume.
+Pull the borehole `LUO_R` resistivity channel out of a fusion volume.
 
 # Arguments
 - `tensor`: `(X, Y, Z, C)` or `(X, Y, Z, C, B)` `Float32` fusion tensor
-- `channel`: 1-based density index (`tensor_channels` YAML `id: 9` → 10)
-- `from_unit`: `:kg_m3` (Voxelizer default) converts with `/1000` to
-  ``g/cm^3``; `:g_cm3` leaves values unchanged
+- `channel`: 1-based resistivity index (`tensor_channels` YAML `id: 0` → 1)
 
 # Returns
-- `target`: `(X, Y, Z, 1, B)` density in ``g/cm^3`` (non-finite → `0`)
-- `mask`:   `(X, Y, Z, 1, B)` `Bool`, `true` at finite petrophysics voxels
+- `target`: `(X, Y, Z, 1, B)` resistivity in ohm·m (non-finite → `0`)
+- `mask`:   `(X, Y, Z, 1, B)` `Bool`, `true` at finite positive petrophysics voxels
 """
-function extract_density_target(tensor::AbstractArray{T};
-                                channel::Int=DENSITY_CHANNEL,
-                                from_unit::Symbol=:kg_m3) where {T}
-    x = _as_5d(tensor)                       # (X, Y, Z, C, B)
+function extract_resistivity_target(tensor::AbstractArray{T};
+                                    channel::Int=RESISTIVITY_CHANNEL) where {T}
+    x = _as_5d(tensor)
     C = size(x, 4)
     (1 <= channel <= C) || throw(BoundsError(x, (:, :, :, channel, :)))
 
-    sl = x[:, :, :, channel:channel, :]      # (X, Y, Z, 1, B)
-    mask = isfinite.(sl)
+    sl = x[:, :, :, channel:channel, :]
+    mask = isfinite.(sl) .& (sl .> 0)
     target = ifelse.(mask, sl, zero(T))
-    if from_unit === :kg_m3
-        target = target .* T(KG_M3_TO_G_CM3)
-    elseif from_unit !== :g_cm3
-        throw(ArgumentError("from_unit must be :kg_m3 or :g_cm3, got $(repr(from_unit))"))
-    end
     return target, mask
+end
+
+"""Legacy alias — density is no longer in the EM prior tensor."""
+function extract_density_target(tensor::AbstractArray{T};
+                                channel::Int=RESISTIVITY_CHANNEL,
+                                from_unit::Symbol=:ohm_m) where {T}
+    return extract_resistivity_target(tensor; channel=channel)
 end
 
 end # module Losses

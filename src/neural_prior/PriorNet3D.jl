@@ -1,17 +1,16 @@
 """
     PriorNet3D
 
-Lightweight Lux.jl 3-D convolutional network that maps a multi-physics fusion
-tensor onto a smart density prior.
+Lightweight Lux.jl 3-D convolutional network that maps an EM/IP/resistivity
+fusion tensor onto a smart resistivity prior.
 
 # Tensors (column-major, `Float32`)
-- Input:  `(X, Y, Z, C_in=11, B)` — fusion volume; `NaN32` holes are zero-filled
-- `m0`:   `(X, Y, Z, 1, B)` — initial density ``m_0`` in ``g/cm^3``
+- Input:  `(X, Y, Z, C_in=4, B)` — fusion volume; `NaN32` holes are zero-filled
+- `m0`:   `(X, Y, Z, 1, B)` — initial resistivity ``m_0`` in ohm·m
 - bounds: `(X, Y, Z, 2, B)` — ``m_{min}`` (channel 1) and ``m_{max}`` (channel 2)
 
-The fusion pipeline stores borehole density as ``kg/m^3`` (channel index 10,
-1-based). Convert with ``\\rho_{g/cm^3} = \\rho_{kg/m^3}/1000`` before comparing
-to `m0` (see `Losses.extract_density_target`).
+Fusion channel 1 is borehole `LUO_R` (ohm·m). Compare to `m0` in log10 space
+(see `Losses.extract_resistivity_target`).
 
 Lux `ps` / `st` are explicit throughout. Compatible with Zygote.jl and
 Optimization.jl.
@@ -29,10 +28,12 @@ export ChannelAttention3D, SpatialAttention3D, CBAM3D
 export ResidualCBAMBlock, SmartPriorNet3D
 export replace_nan, nan_valid_mask, add_batch_dim
 export generate_prior
-export DENSITY_CHANNEL, KG_M3_TO_G_CM3
+export DENSITY_CHANNEL, KG_M3_TO_G_CM3, RESISTIVITY_CHANNEL
 
-# 1-based index of `tensor_channels` name `density` (YAML `id: 9`).
-const DENSITY_CHANNEL::Int = 10
+# 1-based index of `tensor_channels` name `resistivity` (YAML `id: 0`).
+const RESISTIVITY_CHANNEL::Int = 1
+# Legacy alias (density is no longer in the EM prior tensor).
+const DENSITY_CHANNEL::Int = RESISTIVITY_CHANNEL
 # ``1 g/cm^3 = 1000 kg/m^3``.
 const KG_M3_TO_G_CM3::Float32 = 0.001f0
 
@@ -127,41 +128,39 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
-    SmartPriorNet3D(; in_channels=11, hidden=16, n_blocks=2, reduction=4,
-                      spatial_kernel=3, rho_min=1.8f0, rho_max=4.0f0,
-                      delta_max=0.40f0, logit_scale=0.10f0)
+    SmartPriorNet3D(; in_channels=4, hidden=16, n_blocks=2, reduction=4,
+                      spatial_kernel=3, log_rho_min=-1.0f0, log_rho_max=5.0f0,
+                      delta_max=1.0f0, logit_scale=0.10f0)
 
 Lightweight 3-D Conv + CBAM prior network. A `GroupNorm` neck (batch-size-1
 safe) centres features before the 1×1×1 heads.
 
 # Keyword arguments
-- `in_channels`: fusion channels `C_in` (Keivitsa v1 tensor has 11)
+- `in_channels`: fusion channels `C_in` (EM prior tensor has 4)
 - `hidden`: feature width of the stem / residual blocks (keep small; a
   `(292, 212, 48)` grid already has ~3×10⁶ voxels)
 - `n_blocks`: number of [`ResidualCBAMBlock`](@ref)s
 - `reduction`, `spatial_kernel`: forwarded to CBAM
-- `rho_min`, `rho_max`: geological density box for ``m_0``, ``g/cm^3``
-  (covers overburden ~1.8 through mafic/ultramafic ~3.3 and massive sulfide)
-- `delta_max`: maximum half-width of ``[m_{min}, m_{max}]`` around ``m_0``,
-  ``g/cm^3``
+- `log_rho_min`, `log_rho_max`: ``\\log_{10}`` resistivity box for ``m_0``
+  (default 0.1 – 10⁵ Ω·m)
+- `delta_max`: maximum half-width of ``[m_{min}, m_{max}]`` around ``m_0``
+  in log10 decades
 - `logit_scale`: multiplies head logits before sigmoid (keeps a random-init
-  network in the interior of ``[\\rho_{min}, \\rho_{max}]``)
+  network in the interior of the resistivity box)
 
 # Forward
 `(model)(x, ps, st) -> ((m0, bounds), st′)`
 
-- `x`:      `(X, Y, Z, 11, B)` or `(X, Y, Z, 11)` (batch dim added)
-- `m0`:     `(X, Y, Z, 1, B)`  — ``m_0 \\in [\\rho_{min}, \\rho_{max}]``
+- `x`:      `(X, Y, Z, 4, B)` or `(X, Y, Z, 4)` (batch dim added)
+- `m0`:     `(X, Y, Z, 1, B)`  — ``m_0`` in ohm·m
 - `bounds`: `(X, Y, Z, 2, B)`  — channel 1 = ``m_{min}``, channel 2 = ``m_{max}``
-  with ``m_{min} = m_0 - \\delta_-``, ``m_{max} = m_0 + \\delta_+`` and
-  ``0 < \\delta_{\\pm} \\le \\delta_{max}``, then clipped to
-  ``[\\rho_{min}, \\rho_{max}]``
+  with log-space half-widths then ``10^{\\cdot}``
 """
 struct SmartPriorNet3D{B,H1,H2} <: Lux.AbstractLuxContainerLayer{(:body, :m0_head, :bounds_head)}
     in_channels::Int
     hidden::Int
-    rho_min::Float32
-    rho_max::Float32
+    log_rho_min::Float32
+    log_rho_max::Float32
     delta_max::Float32
     logit_scale::Float32
     body::B
@@ -177,19 +176,19 @@ function _group_count(hidden::Int)::Int
 end
 
 function SmartPriorNet3D(;
-                         in_channels::Int=11,
+                         in_channels::Int=4,
                          hidden::Int=16,
                          n_blocks::Int=2,
                          reduction::Int=4,
                          spatial_kernel::Int=3,
-                         rho_min::Float32=1.8f0,
-                         rho_max::Float32=4.0f0,
-                         delta_max::Float32=0.40f0,
+                         log_rho_min::Float32=-1.0f0,
+                         log_rho_max::Float32=5.0f0,
+                         delta_max::Float32=1.0f0,
                          logit_scale::Float32=0.10f0)
     in_channels >= 1 || throw(ArgumentError("in_channels must be ≥ 1"))
     hidden >= 1 || throw(ArgumentError("hidden must be ≥ 1"))
     n_blocks >= 1 || throw(ArgumentError("n_blocks must be ≥ 1"))
-    rho_max > rho_min || throw(ArgumentError("rho_max must exceed rho_min"))
+    log_rho_max > log_rho_min || throw(ArgumentError("log_rho_max must exceed log_rho_min"))
     delta_max > 0 || throw(ArgumentError("delta_max must be positive"))
     logit_scale > 0 || throw(ArgumentError("logit_scale must be positive"))
 
@@ -205,19 +204,19 @@ function SmartPriorNet3D(;
     bounds_head = Conv((1, 1, 1), hidden => 2)   # two positive half-widths
 
     return SmartPriorNet3D{typeof(body),typeof(m0_head),typeof(bounds_head)}(
-        in_channels, hidden, rho_min, rho_max, delta_max, logit_scale,
+        in_channels, hidden, log_rho_min, log_rho_max, delta_max, logit_scale,
         body, m0_head, bounds_head,
     )
 end
 
 """
-Map unbounded logits to ``[\\rho_{min}, \\rho_{max}]`` via sigmoid.
+Map unbounded logits to ``[\\log_{10}\\rho_{min}, \\log_{10}\\rho_{max}]`` via sigmoid.
 AD-safe: scale factors are taken as `eltype(logits)`.
 """
-function _scale_density(logits::AbstractArray{T},
-                        rho_min::Float32, rho_max::Float32) where {T}
-    lo = T(rho_min)
-    hi = T(rho_max)
+function _scale_log_resistivity(logits::AbstractArray{T},
+                                log_rho_min::Float32, log_rho_max::Float32) where {T}
+    lo = T(log_rho_min)
+    hi = T(log_rho_max)
     return lo .+ (hi - lo) .* sigmoid.(logits)
 end
 
@@ -243,18 +242,17 @@ function (m::SmartPriorNet3D)(x::AbstractArray, ps, st)
 
     T = eltype(m0_logits)
     s = T(m.logit_scale)
-    # Scale logits so a random-init Conv head does not saturate sigmoid
-    m0 = _scale_density(m0_logits .* s, m.rho_min, m.rho_max)         # g/cm³
+    lo = T(m.log_rho_min)
+    hi = T(m.log_rho_max)
+    log_m0 = _scale_log_resistivity(m0_logits .* s, m.log_rho_min, m.log_rho_max)
 
-    # Positive half-widths in (0, delta_max], g/cm³
-    δ = T(m.delta_max) .* sigmoid.(bnd_logits .* s)                   # (X, Y, Z, 2, B)
-    δ_lo = δ[:, :, :, 1:1, :]                                        # (X, Y, Z, 1, B)
-    δ_hi = δ[:, :, :, 2:2, :]                                        # (X, Y, Z, 1, B)
-    lo = T(m.rho_min)
-    hi = T(m.rho_max)
-    m_min = _clip(m0 .- δ_lo, lo, hi)                                # (X, Y, Z, 1, B)
-    m_max = _clip(m0 .+ δ_hi, lo, hi)                                # (X, Y, Z, 1, B)
-    bounds = cat(m_min, m_max; dims=4)                               # (X, Y, Z, 2, B)
+    δ = T(m.delta_max) .* sigmoid.(bnd_logits .* s)
+    δ_lo = δ[:, :, :, 1:1, :]
+    δ_hi = δ[:, :, :, 2:2, :]
+    log_min = _clip(log_m0 .- δ_lo, lo, hi)
+    log_max = _clip(log_m0 .+ δ_hi, lo, hi)
+    m0 = exp10.(log_m0)
+    bounds = cat(exp10.(log_min), exp10.(log_max); dims=4)
 
     st_new = (; body=st_body, m0_head=st_m0, bounds_head=st_bnd)
 
@@ -268,8 +266,8 @@ end
 function Base.show(io::IO, m::SmartPriorNet3D)
     print(io, "SmartPriorNet3D(C_in=", m.in_channels,
           ", hidden=", m.hidden,
-          ", ρ∈[", m.rho_min, ",", m.rho_max, "] g/cm³",
-          ", δ_max=", m.delta_max, ")")
+          ", ρ∈[", exp10(m.log_rho_min), ",", exp10(m.log_rho_max), "] Ω·m",
+          ", δ_max=", m.delta_max, " decades)")
 end
 
 """
@@ -278,7 +276,7 @@ end
 Convenience wrapper around `(model)(x, ps, st)`.
 
 # Units
-`m0` and `bounds` are ``g/cm^3``.
+`m0` and `bounds` are ohm·m.
 """
 function generate_prior(model::SmartPriorNet3D, x::AbstractArray, ps, st)
     (m0, bounds), st_new = model(x, ps, st)

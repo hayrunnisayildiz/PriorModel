@@ -1,15 +1,15 @@
 """
     PriorTrainingLoss
 
-Self-constrained prior training objective for [`PriorUNet3DLayers.PriorUNet3D`](@ref):
+Self-constrained prior training objective for [`PriorUNet3DLayers.UnifiedPriorUNet3D`](@ref):
 
 ```
-L_total = λ_well L_sondaj + λ_phys L_forward + λ_smooth L_TV
+L_total = λ_well L_sondaj + λ_smooth L_TV + λ_bounds L_bounds
 ```
 
-- **Well loss** — normalised masked MSE at borehole voxels
-- **Forward loss** — gravity + magnetic prism misfit via precomputed kernels
-- **TV loss** — anisotropic 3-D total variation on the density volume
+- **Well loss** — log10 masked MSE at borehole `LUO_R` voxels (ohm·m)
+- **TV loss** — anisotropic 3-D total variation on ``\\log_{10}\\rho``
+- **Bounds** — hinge on ``m_{min} \\le m_0 \\le m_{max}``
 
 All terms return `Float32` scalars for Zygote / Optimisers.jl.
 """
@@ -25,10 +25,12 @@ using .Losses: total_variation
 export PhysicsContext, PatchTrainContext, SupervisionChannels
 export volume_to_density, volume_to_susceptibility
 export well_loss, forward_physics_loss, combined_loss, combined_loss_terms
-export patch_gravity_loss, patch_combined_loss_terms, bounds_penalty
+export patch_combined_loss_terms, bounds_penalty
+export log10_resistivity
 
 const KG_M3_TO_G_CM3::Float32 = 0.001f0
 const G_CM3_TO_KG_M3::Float32 = 1000.0f0
+const LOG10_RHO_EPS::Float32 = 1.0f-3   # ohm·m floor before log10
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Physics context (precomputed observation / kernel data)
@@ -131,30 +133,35 @@ function combined_loss_terms(vol::AbstractArray,
                              λ_phys::Float32=1.0f-2,
                              λ_smooth::Float32=1.0f-3,
                              tv_mode::Symbol=:anisotropic)
-    # Well supervision: density (kg/m³) + resistivity (Ω·m, linear)
+# Well supervision: predicted resistivity (ohm·m) vs LUO_R / density leftover
     ρ_gcm3 = volume_to_density(vol, ctx.rho_background)
     ρ_kgm3 = ρ_gcm3 .* G_CM3_TO_KG_M3
-    log10ρ_pred = vol[:, :, :, 2:2, :]
-    ρ_ohm = 10.0f0 .^ log10ρ_pred
-    pred_phys = cat(ρ_kgm3, ρ_ohm; dims=4)
-
+    ρ_ohm_pred = vol[:, :, :, 1:1, :]
     tgt = _as_5d(target)
     m = _as_5d(mask)
-    # Use channel-3 mask, but only where petrophysics targets are finite
-    well_mask = m
-    L_well = well_loss(pred_phys, tgt[:, :, :, 1:2, :], well_mask)
+    if size(tgt, 4) >= 2
+        # Y layout: [resistivity, M_sondaj] or legacy [density, resistivity, mask]
+        if size(tgt, 4) == 2
+            log_pred = log10_resistivity(ρ_ohm_pred)
+            log_tgt = log10_resistivity(tgt[:, :, :, 1:1, :])
+            L_well = well_loss(log_pred, log_tgt, m)
+        else
+            pred_phys = cat(ρ_kgm3, ρ_ohm_pred; dims=4)
+            L_well = well_loss(pred_phys, tgt[:, :, :, 1:2, :], m)
+        end
+    else
+        log_pred = log10_resistivity(ρ_ohm_pred)
+        log_tgt = log10_resistivity(tgt)
+        L_well = well_loss(log_pred, log_tgt, m)
+    end
 
-    # Forward physics on batch item 1 (full grid)
-    ρ3 = dropdims(ρ_gcm3[:, :, :, 1, 1]; dims=4)
-    χ3 = dropdims(volume_to_susceptibility(vol, ctx.chi_scale)[:, :, :, 1, 1]; dims=4)
-    L_fwd = forward_physics_loss(ρ3, χ3, ctx)
-
-    # TV on density contrast (geological continuity)
-    δρ = vol[:, :, :, 1:1, :]
-    L_tv = total_variation(δρ; mode=tv_mode)
+    # TV on log-resistivity (geological continuity)
+    L_tv = total_variation(log10_resistivity(ρ_ohm_pred); mode=tv_mode)
 
     T = eltype(L_well)
-    total = T(λ_well) * L_well + T(λ_phys) * L_fwd + T(λ_smooth) * L_tv
+    # Gravity/mag forward no longer applies to a resistivity prior.
+    L_fwd = zero(T)
+    total = T(λ_well) * L_well + T(λ_smooth) * L_tv
     return (; total, well=L_well, forward=L_fwd, tv=L_tv)
 end
 
@@ -169,25 +176,28 @@ combined_loss(args...; kwargs...) = combined_loss_terms(args...; kwargs...).tota
     SupervisionChannels
 
 Channel indices (1-based) inside the **PatchLoader** batch `(Px, Py, Pz, C_in, B)`.
-The last loader channel is always the validity mask; well/gravity indices refer to
+The last loader channel is always the validity mask; well indices refer to
 the underlying fusion / `Y` channels before the appended mask.
 """
 struct SupervisionChannels
-    density::Int
+    resistivity::Int
     well_mask::Int
-    gravity_surface::Union{Int,Nothing}
-    density_unit::Symbol
+    resistivity_unit::Symbol
 end
 
 """
     PatchTrainContext
 
-Precomputed patch-local gravity kernel and optional 2-D surface gravity map.
+Channel map for patch-based resistivity prior training.
 """
 struct PatchTrainContext
-    G_grav::Matrix{Float32}
-    surface_gravity::Union{Array{Float32,3},Nothing}
     channels::SupervisionChannels
+end
+
+"""Zygote-safe ``\\log_{10}\\rho`` with a positive ohm·m floor."""
+function log10_resistivity(ρ::AbstractArray{T}) where {T}
+    ε = T(LOG10_RHO_EPS)
+    return log10.(ifelse.(ρ .> ε, ρ, ε))
 end
 
 """Hinge penalty enforcing ``m_{min} \\le m_0 \\le m_{max}``."""
@@ -201,63 +211,28 @@ function bounds_penalty(m0::AbstractArray, m_min::AbstractArray, m_max::Abstract
     return mean(below .+ above)
 end
 
-"""Convert stored density channel values to ``g/cm^3``."""
-function _density_gcm3(raw::AbstractArray, unit::Symbol)
-    T = eltype(raw)
-    if unit === :kg_m3
-        return raw .* T(KG_M3_TO_G_CM3)
-    elseif unit === :g_cm3
+"""Convert stored resistivity to ohm·m (pass-through; kept for unit checks)."""
+function _resistivity_ohm(raw::AbstractArray, unit::Symbol)
+    if unit === :ohm_m || unit === :ohm_meter
         return raw
     else
-        throw(ArgumentError("density_unit must be :kg_m3 or :g_cm3, got $(repr(unit))"))
+        throw(ArgumentError("resistivity_unit must be :ohm_m, got $(repr(unit))"))
     end
 end
 
 """
-    patch_gravity_loss(m0, origins, ctx) -> Float32
-
-Differentiable prism misfit on each patch: ``\\|G m_0 - d_{obs}\\|^2`` with a
-single centre-top station and observed gravity averaged over the patch footprint
-on the 2-D surface map (when available).
-"""
-function patch_gravity_loss(m0::AbstractArray{T,5},
-                            origins::Vector{NTuple{3,Int}},
-                            ctx::PatchTrainContext)::Float32 where {T}
-    ctx.surface_gravity === nothing && return zero(T)
-    sg = ctx.surface_gravity
-    G = ctx.G_grav
-    px, py, _, _, B = size(m0)
-    loss = zero(T)
-    n = 0
-    @inbounds for b in 1:B
-        i0, j0, _ = origins[b]
-        i1 = min(i0 + px - 1, size(sg, 1))
-        j1 = min(j0 + py - 1, size(sg, 2))
-        slab = @view sg[i0:i1, j0:j1, 1]
-        finite = isfinite.(slab)
-        count(finite) == 0 && continue
-        d_obs = mean(slab[finite])
-        ρ = vec(@view m0[:, :, :, 1, b])
-        g_pred = G * ρ
-        r = g_pred[1] - T(d_obs)
-        loss += r * r
-        n += 1
-    end
-    return n == 0 ? zero(T) : loss / T(n)
-end
-
-"""
-    patch_combined_loss_terms(vol, x, origins, ctx; λ_well, λ_grav, λ_tv, λ_bounds)
+    patch_combined_loss_terms(vol, x, origins, ctx; λ_well, λ_tv, λ_bounds)
 
 Combined patch objective for [`UnifiedPriorUNet3D`](@ref) output
-`(Px, Py, Pz, 3, B)` — channels ``m_0, m_{min}, m_{max}`` in ``g/cm^3``.
+`(Px, Py, Pz, 3, B)` — channels ``m_0, m_{min}, m_{max}`` in ohm·m.
+Well mismatch and TV are evaluated in ``\\log_{10}`` resistivity.
 """
 function patch_combined_loss_terms(vol::AbstractArray,
                                    x::AbstractArray,
                                    origins::Vector{NTuple{3,Int}},
                                    ctx::PatchTrainContext;
                                    λ_well::Float32=1.0f0,
-                                   λ_grav::Float32=1.0f-2,
+                                   λ_grav::Float32=0.0f0,
                                    λ_tv::Float32=1.0f-3,
                                    λ_bounds::Float32=1.0f-4,
                                    tv_mode::Symbol=:anisotropic)
@@ -269,20 +244,22 @@ function patch_combined_loss_terms(vol::AbstractArray,
     m_min = vol5[:, :, :, 2:2, :]
     m_max = vol5[:, :, :, 3:3, :]
 
-    raw_ρ = x5[:, :, :, ch.density:ch.density, :]
-    target = _density_gcm3(raw_ρ, ch.density_unit)
+    raw_ρ = x5[:, :, :, ch.resistivity:ch.resistivity, :]
+    target = _resistivity_ohm(raw_ρ, ch.resistivity_unit)
     well_mask = x5[:, :, :, ch.well_mask:ch.well_mask, :]
-    active = (well_mask .> 0) .& isfinite.(target)
-    L_well = well_loss(m0, target, active)
+    # After PatchLoader, missing resistivity is 0; positive LUO_R marks well voxels.
+    active = (well_mask .> 0) .& (target .> 0) .& isfinite.(target)
 
-    L_grav = patch_gravity_loss(m0, origins, ctx)
-    L_tv = total_variation(m0; mode=tv_mode)
+    log_pred = log10_resistivity(m0)
+    log_tgt = log10_resistivity(target)
+    L_well = well_loss(log_pred, log_tgt, active)
+
+    L_tv = total_variation(log_pred; mode=tv_mode)
     L_bounds = bounds_penalty(m0, m_min, m_max)
 
     T = eltype(L_well)
-    total = T(λ_well) * L_well + T(λ_grav) * L_grav +
-            T(λ_tv) * L_tv + T(λ_bounds) * L_bounds
-    return (; total, well=L_well, gravity=L_grav, tv=L_tv, bounds=L_bounds)
+    total = T(λ_well) * L_well + T(λ_tv) * L_tv + T(λ_bounds) * L_bounds
+    return (; total, well=L_well, gravity=zero(T), tv=L_tv, bounds=L_bounds)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────

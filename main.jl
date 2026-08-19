@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 #=
-Smart Prior Generator & Physics-Constrained 3D Gravity Inversion — orchestrator.
+Smart Prior Generator — EM / IP / resistivity U-Net orchestrator.
 
 Usage (from project root):
     julia --project=. main.jl
@@ -12,10 +12,9 @@ Prerequisites:
     julia --project=. src/training/train_prior.jl   # produces models/best_prior_model.jld2
 
 Pipeline:
-  1. Load preprocessed volume  → keivitsa_preprocessed.h5
-  2. Tiled prior inference     → m0, m_min, m_max  [g/cm³]  (UnifiedPriorUNet3D)
-  3. Physics inversion         → m_final under prior + box constraints
-  4. HDF5 export               → data/processed/density_model_results.h5
+  1. Load preprocessed EM volume → keivitsa_preprocessed.h5
+  2. Tiled prior inference       → m0, m_min, m_max  [ohm·m]  (UnifiedPriorUNet3D)
+  3. HDF5 export                 → data/processed/resistivity_prior_results.h5
 =#
 
 using Pkg
@@ -43,41 +42,28 @@ GPUUtils.init_cuda!()
 include(joinpath(ROOT, "src", "fusion", "GridSpec.jl"))
 include(joinpath(ROOT, "src", "data", "patch_loader.jl"))
 include(joinpath(ROOT, "src", "networks", "prior_unet3d.jl"))
-include(joinpath(ROOT, "src", "physics_inversion", "ForwardGravity.jl"))
-include(joinpath(ROOT, "src", "physics_inversion", "Misfit.jl"))
-include(joinpath(ROOT, "src", "physics_inversion", "InversionSolver.jl"))
 
 using .GPUUtils: cuda_available, to_device, device_label, cuda_diagnostics, gpu_forward
 using .PriorUNet3DLayers: UnifiedPriorUNet3D, replace_nan, OUT_M0, OUT_MMIN, OUT_MMAX
-using .InversionSolver
 
 const VoxGridSpecs = GridSpecs
-const InvGridSpecs = InversionSolver.Misfit.ForwardGravity.GridSpecs
 
 # ── Paths & constants ───────────────────────────────────────────────────────
 
 const PREPROCESSED_H5 = joinpath(ROOT, "data", "processed", "keivitsa_preprocessed.h5")
 const MODEL_CHECKPOINT = joinpath(ROOT, "models", "best_prior_model.jld2")
-const OUTPUT_H5 = joinpath(ROOT, "data", "processed", "density_model_results.h5")
+const OUTPUT_H5 = joinpath(ROOT, "data", "processed", "resistivity_prior_results.h5")
 
-const GRAVITY_CHANNEL::Int = 1
-const RHO_GEO_MIN::Float32 = 1.8f0
-const RHO_GEO_MAX::Float32 = 4.0f0
-
-const INVERSION_COARSEN::Int = 8
-const MAX_OBS_POINTS::Int = 64
-const INVERSION_MAXITERS::Int = 25
-const INVERSION_LAMBDA_PRIOR::Float32 = 1.0f-2
-const INVERSION_LAMBDA_TV::Float32 = 1.0f-3
-const INVERSION_LAMBDA_BOUNDS::Float32 = 1.0f2
+const RES_GEO_MIN::Float32 = 0.1f0      # ohm·m
+const RES_GEO_MAX::Float32 = 1.0f5      # ohm·m
 const INFER_BATCH_SIZE::Int = 4
 
 # ── Dataset helpers ─────────────────────────────────────────────────────────
 
-function load_grid_from_h5(path::AbstractString)::InvGridSpecs.GridSpec
+function load_grid_from_h5(path::AbstractString)::VoxGridSpecs.GridSpec
     h5open(path, "r") do f
         a = HDF5.attributes(f)
-        return InvGridSpecs.GridSpec(
+        return VoxGridSpecs.GridSpec(
             Float32(read(a["xmin"])), Float32(read(a["xmax"])),
             Float32(read(a["ymin"])), Float32(read(a["ymax"])),
             Float32(read(a["zmin"])), Float32(read(a["zmax"])),
@@ -204,7 +190,7 @@ end
                       px, py, pz, in_channels, use_gpu)
 
 Memory-friendly full-grid inference via non-overlapping (with edge-aligned) patches.
-Returns `(m0, m_min, m_max)` `(nx, ny, nz)` `Float32` volumes in ``g/cm^3``.
+Returns `(m0, m_min, m_max)` `(nx, ny, nz)` `Float32` volumes in ohm·m.
 """
 function infer_prior_tiled(model::UnifiedPriorUNet3D, ps, st,
                            h5path::AbstractString, dataset_key::AbstractString;
@@ -288,132 +274,52 @@ function infer_prior_tiled(model::UnifiedPriorUNet3D, ps, st,
     end
 end
 
-# ── Gravity observations & coarsening ───────────────────────────────────────
-
-"""
-    extract_gravity_from_surface(X, grid; channel=1)
-        -> (d_obs, obs_x, obs_y, obs_z)
-
-Surface gravity (mGal) from preprocessed 2-D `X` `(nx, ny, C)`.
-"""
-function extract_gravity_from_surface(X::Array{Float32,3},
-                                      grid::InvGridSpecs.GridSpec;
-                                      channel::Int=GRAVITY_CHANNEL)
-    nxx, nyy, nc = size(X)
-    channel <= nc || throw(ArgumentError("gravity channel $channel > n_channels $nc"))
-
-    xc = InvGridSpecs.x_centers(grid)
-    yc = InvGridSpecs.y_centers(grid)
-    z_surf = grid.zmax
-
-    obs_x = Float32[]
-    obs_y = Float32[]
-    obs_z = Float32[]
-    d_obs = Float32[]
-
-    @inbounds for j in 1:nyy, i in 1:nxx
-        v = X[i, j, channel]
-        isfinite(v) || continue
-        push!(obs_x, xc[i])
-        push!(obs_y, yc[j])
-        push!(obs_z, z_surf)
-        push!(d_obs, v)
-    end
-    return d_obs, obs_x, obs_y, obs_z
-end
-
-function subsample_observations(d_obs, obs_x, obs_y, obs_z;
-                                max_n::Int=MAX_OBS_POINTS,
-                                rng::AbstractRNG=Random.MersenneTwister(42))
-    n = length(d_obs)
-    n <= max_n && return d_obs, obs_x, obs_y, obs_z
-    idx = sort(randperm(rng, n)[1:max_n])
-    return d_obs[idx], obs_x[idx], obs_y[idx], obs_z[idx]
-end
-
-function coarsen_volume(m::Array{Float32,3},
-                        grid::InvGridSpecs.GridSpec,
-                        factor::Int)
-    factor >= 1 || throw(ArgumentError("coarsen factor must be ≥ 1"))
-    factor == 1 && return m, grid
-
-    mc = m[1:factor:end, 1:factor:end, 1:factor:end]
-    nxx, nyy, nzz = size(mc)
-    f = Float32(factor)
-    gc = InvGridSpecs.GridSpec(
-        grid.xmin, grid.xmin + Float32(nxx) * grid.dx * f,
-        grid.ymin, grid.ymin + Float32(nyy) * grid.dy * f,
-        grid.zmin, grid.zmin + Float32(nzz) * grid.dz * f,
-        grid.dx * f, grid.dy * f, grid.dz * f,
-        grid.epsg_code,
-    )
-    return mc, gc
-end
+# ── Range check & persistence ───────────────────────────────────────────────
 
 function check_geological_range(m0::Array{Float32,3};
-                                lo::Float32=RHO_GEO_MIN,
-                                hi::Float32=RHO_GEO_MAX)
+                                lo::Float32=RES_GEO_MIN,
+                                hi::Float32=RES_GEO_MAX)
     mn, mx = extrema(m0)
     μ = mean(m0)
-    println("  m0 statistics: min=$(round(mn; digits=4))  max=$(round(mx; digits=4))  mean=$(round(μ; digits=4)) g/cm³")
+    println("  m0 statistics: min=$(round(mn; digits=4))  max=$(round(mx; digits=4))  mean=$(round(μ; digits=4)) Ω·m")
     if mn >= lo && mx <= hi
-        println("  ✓ m0 within geological range [$(lo), $(hi)] g/cm³")
+        println("  ✓ m0 within geological range [$(lo), $(hi)] Ω·m")
     else
-        println("  ⚠ m0 extends outside [$(lo), $(hi)] g/cm³")
+        println("  ⚠ m0 extends outside [$(lo), $(hi)] Ω·m")
     end
     return mn, mx, μ
-end
-
-function print_misfit_history(history::InversionSolver.InversionHistory; max_lines::Int=30)
-    n = length(history.total)
-    println("── Inversion misfit history ($n records) ──")
-    println("  step     data(mGal²)   prior      tv        bounds    total")
-    idxs = n <= max_lines ? (1:n) : vcat(1:5, (n - max_lines + 6):n)
-    prev = 0
-    for i in idxs
-        prev > 0 && i - prev > 1 && println("  ...")
-        @printf("  %4d  %12.6g  %8.4g  %8.4g  %8.4g  %8.4g\n",
-                i, history.data[i], history.prior[i],
-                history.tv[i], history.bounds[i], history.total[i])
-        prev = i
-    end
 end
 
 function save_results_h5(path::AbstractString;
                          m_prior::Array{Float32,3},
                          m_min::Array{Float32,3},
                          m_max::Array{Float32,3},
-                         m_final::Array{Float32,3},
-                         m_prior_inv::Array{Float32,3},
-                         history::InversionSolver.InversionHistory,
-                         grid_full::InvGridSpecs.GridSpec,
-                         grid_inv::InvGridSpecs.GridSpec,
+                         grid_full::VoxGridSpecs.GridSpec,
                          run_params::NamedTuple)
     mkpath(dirname(path))
     h5open(path, "w") do f
         write(f, "m_prior", m_prior)
-        write(f, "m0", m_prior)                    # legacy alias
+        write(f, "m0", m_prior)
         write(f, "m_min", m_min)
         write(f, "m_max", m_max)
         write(f, "bounds", cat(m_min, m_max; dims=4))
-        write(f, "m_final", m_final)
-        write(f, "m0_inversion_grid", m_prior_inv)
-        write(f, "history/total", history.total)
-        write(f, "history/data", history.data)
-        write(f, "history/prior", history.prior)
-        write(f, "history/tv", history.tv)
-        write(f, "history/bounds", history.bounds)
         attrs = HDF5.attributes(f)
-        attrs["units/density"] = "g/cm3"
-        attrs["units/gravity_misfit"] = "mGal2"
+        attrs["units/resistivity"] = "ohm.m"
+        attrs["prior_domain"] = "resistivity"
+        attrs["channels"] = "resistivity,vlf_resistivity,slingram_real,ip_chargeability"
         for (k, v) in pairs(run_params)
             attrs["run/" * string(k)] = v
         end
         attrs["grid_full/xmin"] = grid_full.xmin
+        attrs["grid_full/xmax"] = grid_full.xmax
+        attrs["grid_full/ymin"] = grid_full.ymin
+        attrs["grid_full/ymax"] = grid_full.ymax
+        attrs["grid_full/zmin"] = grid_full.zmin
+        attrs["grid_full/zmax"] = grid_full.zmax
         attrs["grid_full/dx"] = grid_full.dx
+        attrs["grid_full/dy"] = grid_full.dy
+        attrs["grid_full/dz"] = grid_full.dz
         attrs["grid_full/epsg"] = grid_full.epsg_code
-        attrs["grid_inv/xmin"] = grid_inv.xmin
-        attrs["grid_inv/dx"] = grid_inv.dx
     end
     println("  Saved: $path")
 end
@@ -428,7 +334,7 @@ function run_pipeline()
     end
 
     println("═══════════════════════════════════════════════════════════════")
-    println(" Smart Prior + Physics Inversion Pipeline")
+    println(" Smart Prior — EM / IP / resistivity")
     println(" Preprocessed data: $PREPROCESSED_H5")
     println(" Model checkpoint:    $MODEL_CHECKPOINT")
     println("  Device: ", device_label(use_gpu))
@@ -438,7 +344,7 @@ function run_pipeline()
         error("Preprocessed dataset not found: $(PREPROCESSED_H5)")
 
     # ── Step 1: Load trained prior ───────────────────────────────────────────
-    println("\n[Step 1/4] Loading trained UnifiedPriorUNet3D checkpoint")
+    println("\n[Step 1/3] Loading trained UnifiedPriorUNet3D checkpoint")
     local model::UnifiedPriorUNet3D
     local ps
     local st
@@ -455,11 +361,11 @@ function run_pipeline()
     @printf("  Step 1 done in %.1fs\n", step1_t)
 
     # ── Step 2: Tiled full-volume prior inference ────────────────────────────
-    println("\n[Step 2/4] Tiled prior inference (memory-safe full grid)")
+    println("\n[Step 2/3] Tiled resistivity prior inference (memory-safe full grid)")
     local m0_full::Array{Float32,3}
     local m_min_full::Array{Float32,3}
     local m_max_full::Array{Float32,3}
-    local grid_full::InvGridSpecs.GridSpec
+    local grid_full::VoxGridSpecs.GridSpec
     local dataset_key::String
     local in_channels::Int
 
@@ -483,65 +389,15 @@ function run_pipeline()
         )
         println("  Prior shapes: m0=$(size(m0_full))  m_min=$(size(m_min_full))")
         check_geological_range(m0_full)
-        @printf("  Bounds: m_min∈[%.3f, %.3f]  m_max∈[%.3f, %.3f] g/cm³\n",
+        @printf("  Bounds: m_min∈[%.4g, %.4g]  m_max∈[%.4g, %.4g] Ω·m\n",
                 minimum(m_min_full), maximum(m_min_full),
                 minimum(m_max_full), maximum(m_max_full))
     end
     @printf("  Step 2 done in %.1fs\n", step2_t)
 
-    # ── Step 3: Physics-constrained inversion ────────────────────────────────
-    println("\n[Step 3/4] Physics-constrained gravity inversion (L-BFGS)")
-    local m_final::Array{Float32,3}
-    local m0_inv::Array{Float32,3}
-    local history::InversionSolver.InversionHistory
-    local grid_inv::InvGridSpecs.GridSpec
-
+    # ── Step 3: HDF5 export ─────────────────────────────────────────────────
+    println("\n[Step 3/3] Saving resistivity prior to HDF5")
     step3_t = @elapsed begin
-        X_surf = h5open(PREPROCESSED_H5, "r") do f
-            haskey(f, "X") ? read(f, "X") : nothing
-        end
-        X_surf === nothing && error("Surface gravity `X` not found in $(PREPROCESSED_H5)")
-
-        d_obs, obs_x, obs_y, obs_z = extract_gravity_from_surface(X_surf, grid_full)
-        n_raw = length(d_obs)
-        println("  Gravity stations from surface X (channel $GRAVITY_CHANNEL): $n_raw")
-        n_raw == 0 && error("no finite gravity values in surface X")
-
-        d_obs, obs_x, obs_y, obs_z = subsample_observations(
-            d_obs, obs_x, obs_y, obs_z; max_n=MAX_OBS_POINTS)
-        println("  Using $(length(d_obs)) observation points (max=$MAX_OBS_POINTS)")
-
-        m0, grid_inv = coarsen_volume(m0_full, grid_full, INVERSION_COARSEN)
-        m0_inv = m0
-        m_min, _ = coarsen_volume(m_min_full, grid_full, INVERSION_COARSEN)
-        m_max, _ = coarsen_volume(m_max_full, grid_full, INVERSION_COARSEN)
-        println("  Inversion grid coarsen×$(INVERSION_COARSEN): ", grid_inv,
-                "  model size=$(size(m0))")
-
-        result = InversionSolver.run_physics_inversion(
-            m0, m_min, m_max, d_obs, grid_inv, obs_x, obs_y, obs_z;
-            maxiters=INVERSION_MAXITERS,
-            λ_prior=INVERSION_LAMBDA_PRIOR,
-            λ_tv=INVERSION_LAMBDA_TV,
-            λ_bounds=INVERSION_LAMBDA_BOUNDS,
-            verbose=true,
-        )
-        m_final = result.m_final
-        history = result.history
-
-        println("  Optimizer retcode: ", result.sol.retcode)
-        @printf("  m_final: min=%.4f  max=%.4f  mean=%.4f g/cm³\n",
-                minimum(m_final), maximum(m_final), mean(m_final))
-        n_hist = length(history.total)
-        n_hist >= 1 && @printf("  Final misfit: data=%.6g  total=%.6g (mGal² scale on data term)\n",
-                               history.data[end], history.total[end])
-        print_misfit_history(history)
-    end
-    @printf("  Step 3 done in %.1fs\n", step3_t)
-
-    # ── Step 4: HDF5 export ─────────────────────────────────────────────────
-    println("\n[Step 4/4] Saving results to HDF5")
-    step4_t = @elapsed begin
         run_params = (
             checkpoint=basename(MODEL_CHECKPOINT),
             dataset_key=dataset_key,
@@ -549,12 +405,6 @@ function run_pipeline()
             patch_px=meta.cfg !== nothing ? meta.cfg.px : 32,
             patch_py=meta.cfg !== nothing ? meta.cfg.py : 32,
             patch_pz=meta.cfg !== nothing ? meta.cfg.pz : 16,
-            coarsen_factor=INVERSION_COARSEN,
-            max_obs=MAX_OBS_POINTS,
-            maxiters=INVERSION_MAXITERS,
-            lambda_prior=INVERSION_LAMBDA_PRIOR,
-            lambda_tv=INVERSION_LAMBDA_TV,
-            lambda_bounds=INVERSION_LAMBDA_BOUNDS,
             train_epoch=meta.epoch,
             train_best_loss=meta.best_loss,
         )
@@ -562,14 +412,10 @@ function run_pipeline()
                         m_prior=m0_full,
                         m_min=m_min_full,
                         m_max=m_max_full,
-                        m_final=m_final,
-                        m_prior_inv=m0_inv,
-                        history=history,
                         grid_full=grid_full,
-                        grid_inv=grid_inv,
                         run_params=run_params)
     end
-    @printf("  Step 4 done in %.1fs\n", step4_t)
+    @printf("  Step 3 done in %.1fs\n", step3_t)
 
     total_t = time() - pipeline_start
     println("\n═══════════════════════════════════════════════════════════════")
@@ -577,7 +423,7 @@ function run_pipeline()
     println(" Output: $OUTPUT_H5")
     println("═══════════════════════════════════════════════════════════════")
 
-    return (; grid_full, m0_full, m_min_full, m_max_full, m_final, history)
+    return (; grid_full, m0_full, m_min_full, m_max_full)
 end
 
 function main()

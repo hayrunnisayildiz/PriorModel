@@ -22,7 +22,7 @@ sampler = PatchSampler("data/processed/keivitsa_preprocessed.h5";
                        batch_size=4, n_batches=100)
 
 for batch in sampler
-    X = batch.data   # (32, 32, 16, 12, 4) for C=11
+    X = batch.data   # (32, 32, 16, 5, 4) for C=4 EM channels + mask
     # ...
 end
 close(sampler)

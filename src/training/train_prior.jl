@@ -1,9 +1,9 @@
 #!/usr/bin/env julia
 #=
-Patch-based UnifiedPriorUNet3D training (Prompt 3).
+Patch-based UnifiedPriorUNet3D training — EM / IP / resistivity prior.
 
 Combined loss:
-    L_total = λ_well L_sondaj + λ_grav L_gravity + λ_TV L_TV + λ_bounds L_bounds
+    L_total = λ_well L_sondaj + λ_TV L_TV + λ_bounds L_bounds
 
 Usage (from project root):
     julia --project=. src/training/train_prior.jl
@@ -40,24 +40,14 @@ GPUUtils.init_cuda!()
 include(joinpath(ROOT, "src", "fusion", "GridSpec.jl"))
 include(joinpath(ROOT, "src", "data", "patch_loader.jl"))
 include(joinpath(ROOT, "src", "networks", "prior_unet3d.jl"))
-include(joinpath(ROOT, "src", "physics_inversion", "ForwardGravity.jl"))
-include(joinpath(ROOT, "src", "neural_prior", "Losses.jl"))
 include(joinpath(ROOT, "src", "training", "PriorTrainingLoss.jl"))
 
 using .GPUUtils: cuda_available, to_device, device_label, cuda_diagnostics, gpu_forward
 using .PatchLoader: PatchSampler, PatchBatch, close
 using .PriorUNet3DLayers: UnifiedPriorUNet3D
-using .ForwardGravity: gravity_kernel_matrix
 using .PriorTrainingLoss: PatchTrainContext, SupervisionChannels, patch_combined_loss_terms
-using .Losses: DENSITY_CHANNEL
 
 const GridSpec = GridSpecs.GridSpec
-const FwdGridSpec = ForwardGravity.GridSpecs.GridSpec
-
-"""Convert fusion `GridSpec` to the forward-operator copy."""
-to_forward_grid(g::GridSpec)::FwdGridSpec =
-    FwdGridSpec(g.xmin, g.xmax, g.ymin, g.ymax, g.zmin, g.zmax,
-                g.dx, g.dy, g.dz, g.epsg_code)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults
@@ -112,54 +102,49 @@ function resolve_dataset_key(path::AbstractString;
     end
 end
 
-"""Load 2-D surface gravity `(nx, ny, 1)` from preprocessed `X` if present."""
-function load_surface_gravity(path::AbstractString;
-                              gravity_ch::Int=1)::Union{Array{Float32,3},Nothing}
+"""Load fusion / target channel names from HDF5 root attributes."""
+function load_channel_names(path::AbstractString, dataset_key::AbstractString)::Vector{String}
     h5open(path, "r") do f
-        haskey(f, "X") || return nothing
-        X = read(f, "X")
-        ndims(X) == 3 || return nothing
-        gravity_ch <= size(X, 3) || return nothing
-        return reshape(X[:, :, gravity_ch], size(X, 1), size(X, 2), 1)
+        a = HDF5.attributes(f)
+        if dataset_key == "fusion" && haskey(a, "fusion_channel_names")
+            return Vector{String}(read(a["fusion_channel_names"]))
+        elseif dataset_key == "Y" && haskey(a, "target_channel_names")
+            return Vector{String}(read(a["target_channel_names"]))
+        elseif haskey(a, "fusion_channel_names")
+            return Vector{String}(read(a["fusion_channel_names"]))
+        elseif haskey(a, "input_channel_names")
+            return Vector{String}(read(a["input_channel_names"]))
+        end
+        return String[]
     end
 end
 
-"""Resolve supervision channel indices from dataset key and HDF5 metadata."""
+function _find_channel(names::Vector{String}, candidates::Vector{String}; default::Int)
+    isempty(names) && return default
+    lower = lowercase.(names)
+    for cand in candidates
+        idx = findfirst(==(lowercase(cand)), lower)
+        idx !== nothing && return Int(idx)
+    end
+    return default
+end
+
+"""Resolve well-resistivity supervision indices from dataset key and HDF5 metadata."""
 function supervision_channels(path::AbstractString, dataset_key::AbstractString,
                               nc::Int)::SupervisionChannels
-    if dataset_key == "Y"
-        return SupervisionChannels(1, 3, nothing, :kg_m3)
-    elseif dataset_key == "fusion"
-        return SupervisionChannels(DENSITY_CHANNEL, DENSITY_CHANNEL, 1, :kg_m3)
-    end
-    h5open(path, "r") do f
-        if haskey(f, "Y") || occursin("target", lowercase(dataset_key))
-            return SupervisionChannels(min(1, nc), min(3, nc), nothing, :kg_m3)
-        end
-    end
-    return SupervisionChannels(min(1, nc), min(1, nc), 1, :kg_m3)
-end
-
-"""Build a fixed patch-local Nagy prism kernel (one centre-top station)."""
-function build_patch_gravity_operator(px::Int, py::Int, pz::Int,
-                                      dx::Float32, dy::Float32, dz::Float32)
-    # Local frame: surface at z = 0, subsurface negative (metres, z up).
-    grid = to_forward_grid(GridSpec(0.0f0, px * dx, 0.0f0, py * dy, -pz * dz, 0.0f0,
-                                    dx, dy, dz, 0))
-    ox = Float32[px * dx / 2]
-    oy = Float32[py * dy / 2]
-    oz = Float32[0.0f0]
-    G = gravity_kernel_matrix(grid, ox, oy, oz)
-    return G
+    names = load_channel_names(path, dataset_key)
+    res_idx = _find_channel(names, ["resistivity", "luo_r"]; default=1)
+    mask_idx = _find_channel(names, ["m_sondaj", "mask", "well_mask"]; default=res_idx)
+    res_idx = clamp(res_idx, 1, nc)
+    mask_idx = clamp(mask_idx, 1, nc)
+    return SupervisionChannels(res_idx, mask_idx, :ohm_m)
 end
 
 function build_patch_train_context(path::AbstractString, dataset_key::AbstractString, nc::Int,
                                    px::Int, py::Int, pz::Int)::PatchTrainContext
-    grid = load_grid_from_h5(path)
     ch = supervision_channels(path, dataset_key, nc)
-    sg = load_surface_gravity(path; gravity_ch= something(ch.gravity_surface, 1))
-    G = build_patch_gravity_operator(px, py, pz, grid.dx, grid.dy, grid.dz)
-    return PatchTrainContext(G, sg, ch)
+    @info "Supervision channels" resistivity=ch.resistivity well_mask=ch.well_mask unit=ch.resistivity_unit
+    return PatchTrainContext(ch)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -179,7 +164,6 @@ Base.@kwdef struct TrainConfig
     epochs::Int = 30
     lr::Float64 = 1.0e-3
     lambda_well::Float32 = 1.0f0
-    lambda_grav::Float32 = 1.0f-2
     lambda_tv::Float32 = 1.0f-3
     lambda_bounds::Float32 = 1.0f-4
     base_channels::Int = 16
@@ -222,15 +206,15 @@ end
 """One mini-batch forward + backward pass."""
 function train_step!(model::UnifiedPriorUNet3D, ps, st, opt_state,
                      batch::PatchBatch, ctx::PatchTrainContext, use_gpu::Bool;
-                     λ_well::Float32, λ_grav::Float32, λ_tv::Float32, λ_bounds::Float32)
+                     λ_well::Float32, λ_tv::Float32, λ_bounds::Float32)
     x = to_device(batch.data, Val(use_gpu))
 
     loss_and_grad = Zygote.withgradient(ps) do p
         gpu_forward(use_gpu) do
             vol, _ = model(x, p, st)
             patch_combined_loss_terms(vol, x, batch.origins, ctx;
-                                      λ_well=λ_well, λ_grav=λ_grav,
-                                      λ_tv=λ_tv, λ_bounds=λ_bounds).total
+                                      λ_well=λ_well, λ_tv=λ_tv,
+                                      λ_bounds=λ_bounds).total
         end
     end
 
@@ -238,8 +222,8 @@ function train_step!(model::UnifiedPriorUNet3D, ps, st, opt_state,
         model(x, ps, st)
     end
     terms = patch_combined_loss_terms(vol, x, batch.origins, ctx;
-                                      λ_well=λ_well, λ_grav=λ_grav,
-                                      λ_tv=λ_tv, λ_bounds=λ_bounds)
+                                      λ_well=λ_well, λ_tv=λ_tv,
+                                      λ_bounds=λ_bounds)
     Optimisers.update!(opt_state, ps, loss_and_grad.grad[1])
     return terms, st_new
 end
@@ -267,7 +251,7 @@ function main(cfg::TrainConfig=TrainConfig())
     end
 
     println("═" ^ 60)
-    println(" Patch-based UnifiedPriorUNet3D training")
+    println(" Patch-based UnifiedPriorUNet3D training (EM / resistivity)")
     println("═" ^ 60)
     println("  Device: ", device_label(use_gpu))
 
@@ -278,8 +262,6 @@ function main(cfg::TrainConfig=TrainConfig())
 
     ctx = build_patch_train_context(cfg.dataset, dataset_key, nc,
                                     cfg.px, cfg.py, cfg.pz)
-    ctx.surface_gravity === nothing &&
-        @warn "No surface gravity map (X); L_gravity will be zero"
 
     sampler = PatchSampler(cfg.dataset;
                            dataset_key=dataset_key,
@@ -296,7 +278,6 @@ function main(cfg::TrainConfig=TrainConfig())
     opt_state = Optimisers.setup(opt, ps)
 
     λ_well    = cfg.lambda_well
-    λ_grav    = cfg.lambda_grav
     λ_tv      = cfg.lambda_tv
     λ_bounds  = cfg.lambda_bounds
 
@@ -306,25 +287,23 @@ function main(cfg::TrainConfig=TrainConfig())
     println("\nStarting training for $(cfg.epochs) epochs")
     @printf("  patch=(%d,%d,%d)  batch=%d  batches/epoch=%d\n",
             cfg.px, cfg.py, cfg.pz, cfg.batch_size, cfg.batches_per_epoch)
-    @printf("  λ_well=%.2e  λ_grav=%.2e  λ_tv=%.2e  λ_bounds=%.2e  lr=%.2e\n",
-            λ_well, λ_grav, λ_tv, λ_bounds, cfg.lr)
+    @printf("  λ_well=%.2e  λ_tv=%.2e  λ_bounds=%.2e  lr=%.2e\n",
+            λ_well, λ_tv, λ_bounds, cfg.lr)
 
     try
         for epoch in 1:cfg.epochs
             epoch_total = 0.0f0
             epoch_well = 0.0f0
-            epoch_grav = 0.0f0
             epoch_tv = 0.0f0
             epoch_bounds = 0.0f0
             n_seen = 0
 
             for batch in sampler
                 terms, st = train_step!(model, ps, st, opt_state, batch, ctx, use_gpu;
-                                        λ_well=λ_well, λ_grav=λ_grav,
-                                        λ_tv=λ_tv, λ_bounds=λ_bounds)
+                                        λ_well=λ_well, λ_tv=λ_tv,
+                                        λ_bounds=λ_bounds)
                 epoch_total += terms.total
                 epoch_well += terms.well
-                epoch_grav += terms.gravity
                 epoch_tv += terms.tv
                 epoch_bounds += terms.bounds
                 n_seen += 1
@@ -332,11 +311,10 @@ function main(cfg::TrainConfig=TrainConfig())
 
             n_seen > 0 || error("no batches consumed — check PatchSampler / dataset")
             avg_total = epoch_total / n_seen
-            @printf("Epoch %3d/%d  total=%.6e  L_sondaj=%.6e  L_gravity=%.6e  L_TV=%.6e  L_bounds=%.6e\n",
+            @printf("Epoch %3d/%d  total=%.6e  L_sondaj=%.6e  L_TV=%.6e  L_bounds=%.6e\n",
                     epoch, cfg.epochs,
                     avg_total,
                     epoch_well / n_seen,
-                    epoch_grav / n_seen,
                     epoch_tv / n_seen,
                     epoch_bounds / n_seen)
 
