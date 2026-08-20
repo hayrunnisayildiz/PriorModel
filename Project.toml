@@ -27,4 +27,11 @@ Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 [compat]
 Lux = "1.31"
 LuxCUDA = "0.3"
-julia = "1.10"
+MTGeophysics = "0.4.2"
+julia = "1.11"
+
+# [sources] requires Julia 1.11+. Pin to the tag matching the previously
+# developed local checkout (Manifest reported 0.4.2). v0.5.0 on `main` is a
+# breaking 3D-API release; 2D VFSA2DMT used here is the 0.4.2 surface.
+[sources]
+MTGeophysics = {url = "https://github.com/JuliaGeophysics/MTGeophysics.jl", rev = "v0.4.2"}

@@ -3,9 +3,7 @@
 # Run on Colab:
 #   julia --project=/content/PriorModel /content/PriorModel/scripts/gpu_stack_repro.jl
 
-using Pkg
 include(joinpath(@__DIR__, "..", "src", "pkg_setup.jl"))
-activate_project!(joinpath(@__DIR__, ".."))
 
 function section(title)
     println("\n", "=" ^ 60)

@@ -36,7 +36,7 @@ using Statistics
 
 include("MeshParams.jl")
 using .MTMeshParams: MeshParams, DEFAULT_MESH, validate_mesh_params
-using .MTMeshParams: n_periods, frequencies_hz, profile_length
+using .MTMeshParams: n_periods, frequencies_hz, profile_length, station_positions
 
 function _coerce_mesh_params(mp)::MeshParams
     mp isa MeshParams && return validate_mesh_params(mp)
@@ -90,15 +90,11 @@ end
 """
     _default_receiver_positions(mp::MeshParams) -> Vector{Float64}
 
-Evenly spaced receivers across the uniform core. For [`DEFAULT_MESH`](@ref)
-this reproduces `collect(-8000:1600:8000)`.
+Receivers on the uniform core, matching synthetic training
+([`station_positions`](@ref)): cell centres subsampled to `mp.n_stations`.
 """
 function _default_receiver_positions(mp::MeshParams)::Vector{Float64}
-    y1, y2 = _default_y_core_range(mp)
-    if mp.n_stations == 1
-        return [(y1 + y2) / 2]
-    end
-    return collect(range(y1, y2; length=mp.n_stations))
+    return station_positions(mp)
 end
 
 """

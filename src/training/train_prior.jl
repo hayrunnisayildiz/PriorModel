@@ -13,9 +13,7 @@ Colab (cwd is /content — do not use --project=. from there):
     julia --project=/content/PriorModel /content/PriorModel/src/training/train_prior.jl
 =#
 
-using Pkg
-include(joinpath(@__DIR__, "..", "..", "src", "pkg_setup.jl"))
-activate_project!(joinpath(@__DIR__, "..", ".."))
+include(joinpath(@__DIR__, "..", "pkg_setup.jl"))
 
 # Load LuxCUDA (CUDA + cuDNN) before Lux network includes (Julia 1.12 world-age).
 try
@@ -32,8 +30,6 @@ using JLD2
 using Lux
 using Zygote
 using Optimisers
-
-const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 
 include(joinpath(ROOT, "src", "gpu_utils.jl"))
 GPUUtils.init_cuda!()

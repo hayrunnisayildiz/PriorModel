@@ -15,11 +15,6 @@ module MTPriorLoss
 
 using Statistics: mean
 
-if !isdefined(@__MODULE__, :Losses)
-    include(joinpath(@__DIR__, "..", "neural_prior", "Losses.jl"))
-end
-using .Losses: total_variation
-
 export mt_prior_loss, mt_prior_loss_terms
 
 """
@@ -61,12 +56,27 @@ function mt_prior_loss_terms(pred::AbstractArray, target::AbstractArray;
 
     L_data = mean(abs, p .- t)
 
-    # TV: promote (nz, nx, B) → (nz, nx, 1, 1, B) for the 3-D TV function
-    p5 = reshape(p, size(p, 1), size(p, 2), 1, 1, size(p, 3))
-    L_tv = total_variation(p5; mode=tv_mode)
+    L_tv = _total_variation_2d(p; mode=tv_mode)
 
     total = T(λ_data) * L_data + T(λ_tv) * L_tv
     return (; total, data=L_data, tv=L_tv)
+end
+
+"""2-D anisotropic/isotropic total variation on `(H, W, B)` arrays."""
+function _total_variation_2d(m::AbstractArray; mode::Symbol=:anisotropic, ε::Float32=1.0f-8)
+    v = _as_3d(m)
+    dh = v[2:end, :, :] .- v[1:end-1, :, :]
+    dw = v[:, 2:end, :] .- v[:, 1:end-1, :]
+    if mode === :anisotropic
+        return mean(abs, dh) + mean(abs, dw)
+    elseif mode === :isotropic
+        T = eltype(v)
+        dh_i = dh[:, 1:end-1, :]
+        dw_i = dw[1:end-1, :, :]
+        return mean(sqrt.(dh_i .* dh_i .+ dw_i .* dw_i .+ T(ε)))
+    else
+        throw(ArgumentError("mode must be :anisotropic or :isotropic, got $(repr(mode))"))
+    end
 end
 
 """Scalar alias."""

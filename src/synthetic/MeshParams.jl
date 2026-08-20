@@ -29,6 +29,12 @@ source of truth for grid geometry and MT sampling.
 11 stations, seven log-spaced periods matching the package default frequencies
 `10.^range(-2, 2, length=7)`.
 
+[`UNET_MESH`](@ref) is the canonical **network** survey (30 stations × 20
+log-spaced periods, `T ∈ [10⁻³, 10³]` s, profile covering at least
+`[-9000, 9000]` m) matching `scripts/build_train_pairs.jl`.
+Use [`station_positions`](@ref) for the training x-axis; resample field data
+with `MTInputStandardizer.standardize_mt_input`.
+
 # Example
 ```julia
 include("src/synthetic/MeshParams.jl")
@@ -44,10 +50,12 @@ module MTMeshParams
 using JLD2
 using JSON3
 
-export MeshParams, DEFAULT_MESH
+export MeshParams, DEFAULT_MESH, UNET_MESH
 export save_mesh_params, load_mesh_params
 export n_periods, n_components, profile_length, depth_extent, frequencies_hz
-export validate_mesh_params, RESISTIVITY_LAYOUT, MT_DATA_LAYOUT, MT_DATA_LAYOUT_TETM
+export station_positions, validate_mesh_params
+export unet_log_periods, UNET_N_PERIODS
+export RESISTIVITY_LAYOUT, MT_DATA_LAYOUT, MT_DATA_LAYOUT_TETM
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data-layout constants (documented contract for downstream modules)
@@ -132,11 +140,77 @@ const DEFAULT_MESH = MeshParams(
     [1.0 / f for f in collect(10 .^ range(-2, 2, length = 7))],  # periods (s)
 )
 
+const UNET_N_PERIODS = 20
+
+"""
+    unet_log_periods(n=UNET_N_PERIODS) -> Vector{Float64}
+
+Log-spaced periods covering typical broadband MT field surveys:
+`T ∈ [10⁻³, 10³]` s. COMMEMI 2-D-I (`T ∈ [0.01, 100]` s) sits strictly inside
+this interval, so resampling does not clamp COMMEMI periods as out-of-distribution.
+"""
+unet_log_periods(n::Integer = UNET_N_PERIODS) =
+    collect(10 .^ range(-3, 3; length = Int(n)))
+
+"""
+    UNET_MESH
+
+Canonical U-Net survey used by `scripts/build_train_pairs.jl`
+(`SyntheticGenerator.GeneratorConfig` defaults):
+
+- profile core: 120 cells × 160 m (`y_core_range = (-9600, 9600)`, 19.2 km)
+  so `station_positions` span at least `[-9000, 9000]` m and COMMEMI's
+  `±8000` m receivers stay in-distribution (v1–v3 used 120 × 25 m ≈ 3 km)
+- target column: 48 cells × 25 m
+- 30 stations (every 4th core-cell centre; `receiver_stride = 4`)
+- 20 log-spaced periods `T = 10.^range(-3, 3, length=20)` s
+  (field-MT band; frequencies `f = 1/T ∈ [10⁻³, 10³]` Hz)
+
+[`DEFAULT_MESH`](@ref) remains the COMMEMI solver mesh (11 × 7). All MT-only
+prior **network** I/O should use `UNET_MESH` (or a checkpoint `MeshParams`
+with the same survey) via [`station_positions`](@ref).
+"""
+const UNET_MESH = MeshParams(
+    120,                                                    # nx
+    48,                                                     # nz
+    160.0,                                                  # dx  (m)  — 19.2 km core
+    25.0,                                                   # dz  (m)
+    30,                                                     # n_stations
+    unet_log_periods(),                                     # T ∈ [1e-3, 1e3] s
+)
+
 n_periods(mp::MeshParams)::Int = length(mp.periods)
 n_components(::MeshParams; tetm::Bool = false)::Int = tetm ? 4 : 2
 profile_length(mp::MeshParams)::Float64 = mp.nx * mp.dx
 depth_extent(mp::MeshParams)::Float64 = mp.nz * mp.dz
 frequencies_hz(mp::MeshParams)::Vector{Float64} = 1.0 ./ mp.periods
+
+"""
+    station_positions(nx, dx, n_stations) -> Vector{Float64}
+    station_positions(mp::MeshParams) -> Vector{Float64}
+
+Profile coordinates (m) of the MT receivers on the uniform core.
+
+Matches synthetic training (`SyntheticGenerator` `receiver_stride`): cell
+centres of the `nx` core cells, subsampled with
+`stride = max(1, round(Int, nx / n_stations))`. This is **not** index-based
+resampling of an arbitrary field survey; it is the training-grid x-axis.
+"""
+function station_positions(nx::Int, dx::Real, n_stations::Int)::Vector{Float64}
+    nx > 0 || error("nx must be positive, got $nx")
+    n_stations > 0 || error("n_stations must be positive, got $n_stations")
+    dx > 0 || error("dx must be positive, got $dx")
+    y1 = -Float64(nx) * Float64(dx) / 2
+    centres = [(j - 0.5) * Float64(dx) + y1 for j in 1:nx]
+    stride = max(1, round(Int, nx / n_stations))
+    ys = centres[1:stride:end]
+    length(ys) >= n_stations ||
+        error("cannot place $n_stations stations on nx=$nx (got $(length(ys)) cell-centre samples)")
+    return Float64.(ys[1:n_stations])
+end
+
+station_positions(mp::MeshParams)::Vector{Float64} =
+    station_positions(mp.nx, mp.dx, mp.n_stations)
 
 """
     validate_mesh_params(mp; require_log_spaced_periods=false) -> MeshParams

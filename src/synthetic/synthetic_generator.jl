@@ -25,7 +25,8 @@ learning work:
 - random rough polygons for discrete bodies, sized and valued from the prior
   distributions;
 - a scenario library (layered, buried block, dipping fault, thrust sheet, basin,
-  dyke, multi-anomaly, half-space) so the network sees generic geology rather than
+  dyke, multi-anomaly, half-space, plus COMMEMI-family two-block / buried-prism /
+  nested-prism geometries) so the network sees generic geology rather than
   only Keivitsa;
 - anisotropic textural noise at the prior correlation lengths.
 
@@ -64,6 +65,11 @@ using Printf
 using Random
 using Statistics
 
+if !isdefined(@__MODULE__, :MTMeshParams)
+    include(joinpath(@__DIR__, "MeshParams.jl"))
+end
+using .MTMeshParams: UNET_MESH, frequencies_hz
+
 export GeneratorConfig, GeneratorMesh, SyntheticModel, PriorSpec
 export build_generator_mesh, load_generator_priors
 export generate_model, generate_dataset, save_dataset, load_dataset
@@ -78,9 +84,16 @@ const AIR_RESISTIVITY::Float64 = 1.0e9
 """MTGeophysics.jl package UUID, for the lazy import in [`mtgeophysics`](@ref)."""
 const MTGEOPHYSICS_UUID = Base.UUID("71b12eb5-90c3-4985-b1e7-1ec075583b1e")
 
-"""Geological scenarios, ordered from simplest to most structurally complex."""
+"""Geological scenarios, ordered from simplest to most structurally complex.
+
+The last three (`:two_block`, `:buried_prism`, `:nested_prism`) belong to the
+COMMEMI 2-D-I geometry family — adjacent rectangular blocks and buried /
+nested sharp prisms — without copying the benchmark's exact resistivities
+or dimensions.
+"""
 const SCENARIOS = (:halfspace, :layered, :layered_block, :multi_anomaly,
-                   :basin, :dyke, :dipping_fault, :thrust_sheet)
+                   :basin, :dyke, :dipping_fault, :thrust_sheet,
+                   :two_block, :buried_prism, :nested_prism)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -93,7 +106,8 @@ Mesh geometry and sampling controls. Every field is echoed into the dataset file
 so a synthetic set documents its own recipe.
 
 # Mesh fields
-- `frequencies`: forward-modelling frequencies, Hz (audio-MT band by default)
+- `frequencies`: forward-modelling frequencies, Hz (field-MT band
+  `f = 1/T` with `T ∈ [10⁻³, 10³]` s, matching `MTMeshParams.UNET_MESH`)
 - `y_core_range`, `y_core_cell`: uniform core of the profile, m
 - `y_padding`, `pad_factor`: lateral padding extent and growth ratio
 - `air_top`, `air_cells`: air column top (negative, m) and row count
@@ -125,20 +139,22 @@ so a synthetic set documents its own recipe.
 """
 Base.@kwdef struct GeneratorConfig
     # mesh
-    frequencies::Vector{Float64} = collect(10 .^ range(1, 4, length = 20))
-    y_core_range::Tuple{Float64,Float64} = (-1500.0, 1500.0)
-    y_core_cell::Float64 = 25.0
+    frequencies::Vector{Float64} = frequencies_hz(UNET_MESH)
+    y_core_range::Tuple{Float64,Float64} = (-UNET_MESH.nx * UNET_MESH.dx / 2,
+                                            UNET_MESH.nx * UNET_MESH.dx / 2)
+    y_core_cell::Float64 = UNET_MESH.dx
     y_padding::Float64 = 100_000.0
     pad_factor::Float64 = 1.4
     air_top::Float64 = -20_000.0
     air_cells::Int = 10
-    target_dz::Float64 = 25.0
-    n_target::Int = 48
+    target_dz::Float64 = UNET_MESH.dz
+    n_target::Int = UNET_MESH.nz
     max_depth::Float64 = 40_000.0
     depth_growth::Float64 = 1.35
-    receiver_stride::Int = 4
+    receiver_stride::Int = max(1, round(Int, UNET_MESH.nx / UNET_MESH.n_stations))
     # sampling
-    scenario_weights::Vector{Float64} = [0.05, 0.15, 0.15, 0.15, 0.12, 0.12, 0.13, 0.13]
+    scenario_weights::Vector{Float64} = [0.04, 0.10, 0.10, 0.10, 0.08, 0.08, 0.08, 0.08,
+                                         0.12, 0.12, 0.10]
     generic_fraction::Float64 = 0.35
     generic_log10_range::Tuple{Float64,Float64} = (0.3, 4.7)
     log10_clip::Tuple{Float64,Float64} = (0.0, 5.0)
@@ -1322,6 +1338,194 @@ function build_thrust_sheet!(canvas::Matrix{Float64}, ctx::SampleContext)
     return canvas
 end
 
+"""
+    paint_rectangle!(canvas, ctx, y_lo, y_hi, z_lo, z_hi, value; edge_m=0)
+
+Stamp a sharp axis-aligned rectangle of `value` (log10 Ω·m). `edge_m > 0`
+blends the contact over that many metres so not every sample is a
+mathematically discontinuous jump.
+"""
+function paint_rectangle!(canvas::Matrix{Float64}, ctx::SampleContext,
+                          y_lo::Real, y_hi::Real, z_lo::Real, z_hi::Real,
+                          value::Real; edge_m::Real = 0.0)
+    nzc, nyc = size(canvas)
+    lo_y, hi_y = min(y_lo, y_hi), max(y_lo, y_hi)
+    lo_z, hi_z = min(z_lo, z_hi), max(z_lo, z_hi)
+    edge = max(Float64(edge_m), 0.0)
+    @inbounds for iy in 1:nyc, iz in 1:nzc
+        y, z = ctx.ys[iy], ctx.zs[iz]
+        if edge <= 0
+            if lo_y <= y <= hi_y && lo_z <= z <= hi_z
+                canvas[iz, iy] = value
+            end
+            continue
+        end
+        # signed distance to the rectangle (negative inside)
+        dy = max(lo_y - y, y - hi_y, 0.0)
+        dz = max(lo_z - z, z - hi_z, 0.0)
+        dist = hypot(dy, dz)
+        inside = (y >= lo_y) && (y <= hi_y) && (z >= lo_z) && (z <= hi_z)
+        if inside
+            canvas[iz, iy] = value
+        elseif dist < edge
+            w = 1 - dist / edge
+            w = w * w * (3 - 2w)
+            canvas[iz, iy] = (1 - w) * canvas[iz, iy] + w * value
+        end
+    end
+    return canvas
+end
+
+"""
+    build_two_block!(canvas, ctx)
+
+Two adjacent rectangular prisms of contrasting resistivity sitting in a host
+half-space — the COMMEMI 2-D-I two-block family, with randomised contact
+position, widths, depths and resistivities so the network does not memorise
+the benchmark geometry.
+"""
+function build_two_block!(canvas::Matrix{Float64}, ctx::SampleContext)
+    host = sample_log10_rho(ctx, :host)
+    fill!(canvas, host)
+
+    span_y = profile_span(ctx)
+    span_z = depth_span(ctx)
+    y_contact = _uniform(ctx.rng, ctx.ys[1] + 0.22 * span_y,
+                         ctx.ys[end] - 0.22 * span_y)
+    w_left = _uniform(ctx.rng, 0.08, 0.32) * span_y
+    w_right = _uniform(ctx.rng, 0.08, 0.32) * span_y
+    y_lo = clamp(y_contact - w_left, ctx.ys[1], ctx.ys[end])
+    y_hi = clamp(y_contact + w_right, ctx.ys[1], ctx.ys[end])
+
+    cover = rand(ctx.rng) < 0.45
+    z_top = ctx.zs[1] + (cover ? _uniform(ctx.rng, 0.05, 0.22) * span_z : 0.0)
+    z_bot_l = clamp(z_top + _uniform(ctx.rng, 0.22, 0.70) * (ctx.zs[end] - z_top),
+                    z_top + 2 * ctx.dz, ctx.zs[end])
+    z_bot_r = clamp(z_top + _uniform(ctx.rng, 0.22, 0.70) * (ctx.zs[end] - z_top),
+                    z_top + 2 * ctx.dz, ctx.zs[end])
+
+    left_kind = rand(ctx.rng) < 0.55 ? :conductive : :resistive
+    right_kind = left_kind === :conductive ?
+                 (rand(ctx.rng) < 0.55 ? :host : :resistive) : :conductive
+    left_v = sample_log10_rho(ctx, left_kind)
+    right_v = sample_log10_rho(ctx, right_kind)
+    edge = rand(ctx.rng) < 0.4 ? _uniform(ctx.rng, 0.0, 1.5) * ctx.dy : 0.0
+
+    paint_rectangle!(canvas, ctx, y_lo, y_contact, z_top, z_bot_l, left_v; edge_m = edge)
+    paint_rectangle!(canvas, ctx, y_contact, y_hi, z_top, z_bot_r, right_v; edge_m = edge)
+
+    ctx.meta["two_block"] = Dict{String,Any}(
+        "contact_y_m" => round(y_contact; digits = 1),
+        "left_log10_rho" => round(left_v; digits = 3),
+        "right_log10_rho" => round(right_v; digits = 3),
+        "host_log10_rho" => round(host; digits = 3),
+        "left_z_m" => [round(z_top; digits = 1), round(z_bot_l; digits = 1)],
+        "right_z_m" => [round(z_top; digits = 1), round(z_bot_r; digits = 1)],
+        "y_span_m" => [round(y_lo; digits = 1), round(y_hi; digits = 1)],
+        "cover" => cover,
+    )
+    return canvas
+end
+
+"""
+    build_buried_prism!(canvas, ctx)
+
+A single sharp rectangular prism (conductive or resistive) buried in a host,
+optionally under a thin cover layer. This is the COMMEMI 2-D-I buried-block
+geometry with randomised size, burial depth and contrast.
+"""
+function build_buried_prism!(canvas::Matrix{Float64}, ctx::SampleContext)
+    host = sample_log10_rho(ctx, :host)
+    fill!(canvas, host)
+
+    span_y = profile_span(ctx)
+    span_z = depth_span(ctx)
+    has_cover = rand(ctx.rng) < 0.35
+    if has_cover
+        cover_v = sample_log10_rho(ctx, rand(ctx.rng) < 0.5 ? :host : :conductive)
+        cover_z = ctx.zs[1] + _uniform(ctx.rng, 0.04, 0.18) * span_z
+        paint_rectangle!(canvas, ctx, ctx.ys[1], ctx.ys[end], ctx.zs[1], cover_z, cover_v)
+        ctx.meta["cover"] = Dict{String,Any}(
+            "log10_rho" => round(cover_v; digits = 3),
+            "base_m" => round(cover_z; digits = 1),
+        )
+    end
+
+    kind = rand(ctx.rng) < 0.7 ? :conductive : :resistive
+    value = sample_log10_rho(ctx, kind)
+    half_w = 0.5 * _uniform(ctx.rng, 0.10, 0.40) * span_y
+    thick = _uniform(ctx.rng, 0.12, 0.50) * span_z
+    y0 = _uniform(ctx.rng, ctx.ys[1] + half_w, ctx.ys[end] - half_w)
+    z_min = has_cover ? ctx.zs[1] + 0.04 * span_z : ctx.zs[1]
+    z_top = _uniform(ctx.rng, z_min, ctx.zs[1] + 0.40 * span_z)
+    z_bot = clamp(z_top + thick, z_top + 2 * ctx.dz, ctx.zs[end])
+    edge = rand(ctx.rng) < 0.35 ? _uniform(ctx.rng, 0.0, 1.5) * ctx.dy : 0.0
+    paint_rectangle!(canvas, ctx, y0 - half_w, y0 + half_w, z_top, z_bot, value;
+                     edge_m = edge)
+
+    ctx.meta["buried_prism"] = Dict{String,Any}(
+        "kind" => String(kind),
+        "log10_rho" => round(value; digits = 3),
+        "host_log10_rho" => round(host; digits = 3),
+        "y_center_m" => round(y0; digits = 1),
+        "half_width_m" => round(half_w; digits = 1),
+        "z_range_m" => [round(z_top; digits = 1), round(z_bot; digits = 1)],
+    )
+    return canvas
+end
+
+"""
+    build_nested_prism!(canvas, ctx)
+
+A rectangular core of contrasting resistivity nested inside a larger
+rectangular host block (gömülü dikdörtgen çekirdek). The outer block sits in
+a half-space; sizes and resistivities are drawn, not copied from COMMEMI.
+"""
+function build_nested_prism!(canvas::Matrix{Float64}, ctx::SampleContext)
+    host = sample_log10_rho(ctx, :host)
+    fill!(canvas, host)
+
+    span_y = profile_span(ctx)
+    span_z = depth_span(ctx)
+    outer_hw = 0.5 * _uniform(ctx.rng, 0.18, 0.50) * span_y
+    outer_hh = 0.5 * _uniform(ctx.rng, 0.20, 0.60) * span_z
+    y0 = _uniform(ctx.rng, ctx.ys[1] + outer_hw, ctx.ys[end] - outer_hw)
+    z0 = _uniform(ctx.rng, ctx.zs[1] + outer_hh, ctx.zs[end] - outer_hh)
+
+    outer_kind = rand(ctx.rng) < 0.5 ? :host : (rand(ctx.rng) < 0.5 ? :conductive : :resistive)
+    inner_kind = outer_kind === :conductive ? :resistive :
+                 (outer_kind === :resistive ? :conductive :
+                  (rand(ctx.rng) < 0.7 ? :conductive : :resistive))
+    outer_v = sample_log10_rho(ctx, outer_kind)
+    inner_v = sample_log10_rho(ctx, inner_kind)
+
+    shrink = _uniform(ctx.rng, 0.30, 0.65)
+    inner_hw = max(shrink * outer_hw, 1.5 * ctx.dy)
+    inner_hh = max(shrink * outer_hh, 1.5 * ctx.dz)
+    # jitter the core inside the outer block, keeping a one-cell margin
+    y_slack = max(outer_hw - inner_hw - ctx.dy, 0.0)
+    z_slack = max(outer_hh - inner_hh - ctx.dz, 0.0)
+    y1 = y0 + _uniform(ctx.rng, -y_slack, y_slack)
+    z1 = z0 + _uniform(ctx.rng, -z_slack, z_slack)
+    edge = rand(ctx.rng) < 0.3 ? _uniform(ctx.rng, 0.0, 1.2) * ctx.dy : 0.0
+
+    paint_rectangle!(canvas, ctx, y0 - outer_hw, y0 + outer_hw,
+                     z0 - outer_hh, z0 + outer_hh, outer_v; edge_m = edge)
+    paint_rectangle!(canvas, ctx, y1 - inner_hw, y1 + inner_hw,
+                     z1 - inner_hh, z1 + inner_hh, inner_v; edge_m = edge)
+
+    ctx.meta["nested_prism"] = Dict{String,Any}(
+        "outer_log10_rho" => round(outer_v; digits = 3),
+        "inner_log10_rho" => round(inner_v; digits = 3),
+        "host_log10_rho" => round(host; digits = 3),
+        "outer_center_m" => [round(y0; digits = 1), round(z0; digits = 1)],
+        "inner_center_m" => [round(y1; digits = 1), round(z1; digits = 1)],
+        "outer_half_m" => [round(outer_hw; digits = 1), round(outer_hh; digits = 1)],
+        "inner_half_m" => [round(inner_hw; digits = 1), round(inner_hh; digits = 1)],
+    )
+    return canvas
+end
+
 function _record_stack!(ctx::SampleContext, stack::LayerStack)
     ctx.meta["layers"] = Dict{String,Any}(
         "n" => length(stack.values),
@@ -1342,6 +1546,9 @@ const _BUILDERS = Dict{Symbol,Function}(
     :dyke => build_dyke!,
     :dipping_fault => build_dipping_fault!,
     :thrust_sheet => build_thrust_sheet!,
+    :two_block => build_two_block!,
+    :buried_prism => build_buried_prism!,
+    :nested_prism => build_nested_prism!,
 )
 
 """

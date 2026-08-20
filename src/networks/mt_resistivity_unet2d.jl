@@ -21,11 +21,12 @@ using Statistics: mean
 if !isdefined(@__MODULE__, :MTMeshParams)
     include(joinpath(@__DIR__, "..", "synthetic", "MeshParams.jl"))
 end
-using .MTMeshParams: MeshParams, DEFAULT_MESH, n_periods, n_components, validate_mesh_params
+using .MTMeshParams: MeshParams, DEFAULT_MESH, UNET_MESH, n_periods, n_components, validate_mesh_params
 
 export Conv2dGNBlock, DoubleConv2DBlock, EncoderStage2D, DecoderStage2D, BottleneckStage2D
 export MTInputProjector, MTResistivityUNet2D, replace_nan, add_batch_dim, generate_logres_prior
 export ChannelAttention2D, SpatialAttention2D, CBAM2D
+export AttentiveDecoder2D, count_parameters, report_capacity_change
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -301,12 +302,41 @@ function (m::DecoderStage2D)(x::AbstractArray{T,4}, skip::Union{AbstractArray{T,
     if m.skip_ch > 0
         skip === nothing && error("DecoderStage2D expects a skip tensor, got nothing")
         H, W = size(h)[1:2]
-        skip = _crop_hw(skip, H, W)
+        skip = _pad_hw(skip, H, W)
         h = cat(h, skip; dims=3)
     end
     h, st_c = m.conv(h, ps.conv, st.conv)
     return h, (; upsample_layer=st_up, conv=st_c)
 end
+
+"""
+    AttentiveDecoder2D(up_ch, skip_ch, out_ch; kernel=3)
+
+[`DecoderStage2D`](@ref) followed by [`CBAM2D`](@ref) so every decoder scale
+has attention (encoder stages already include CBAM).
+"""
+struct AttentiveDecoder2D{D,CB} <: Lux.AbstractLuxContainerLayer{(:decoder, :cbam)}
+    decoder::D
+    cbam::CB
+end
+
+function AttentiveDecoder2D(up_ch::Int, skip_ch::Int, out_ch::Int; kernel::Int=3,
+                            reduction::Int=4, spatial_kernel::Int=3)
+    dec = DecoderStage2D(up_ch, skip_ch, out_ch; kernel=kernel)
+    cbam = CBAM2D(out_ch; reduction=reduction, spatial_kernel=spatial_kernel)
+    return AttentiveDecoder2D{typeof(dec),typeof(cbam)}(dec, cbam)
+end
+
+function (m::AttentiveDecoder2D)(x::AbstractArray{T,4}, skip::Union{AbstractArray{T,4},Nothing},
+                                 ps, st) where {T}
+    h, st_d = m.decoder(x, skip, ps.decoder, st.decoder)
+    h, st_c = m.cbam(h, ps.cbam, st.cbam)
+    return h, (; decoder=st_d, cbam=st_c)
+end
+
+"""Zero-parameter placeholder so `n_down=2` checkpoints keep a uniform layer set."""
+struct EmptyLayer <: Lux.AbstractLuxLayer end
+(m::EmptyLayer)(x, ps, st) = x, st
 
 """
     BottleneckStage2D(channels; kernel=3)
@@ -356,7 +386,8 @@ end
 
 function MTInputProjector(n_stations::Int, n_periods::Int,
                           out_h::Int, out_w::Int, out_ch::Int;
-                          in_channels::Int=2, hidden_mult::Int=4)
+                          in_channels::Int=2, hidden_mult::Int=4,
+                          hidden::Union{Nothing,Int}=nothing)
     n_stations >= 1 || throw(ArgumentError("n_stations must be ≥ 1"))
     n_periods >= 1 || throw(ArgumentError("n_periods must be ≥ 1"))
     in_channels >= 1 || throw(ArgumentError("in_channels must be ≥ 1"))
@@ -366,10 +397,11 @@ function MTInputProjector(n_stations::Int, n_periods::Int,
 
     in_dim = n_stations * n_periods * in_channels
     out_dim = out_h * out_w * out_ch
-    hidden = max(out_ch * hidden_mult, 64)
+    hdim = hidden === nothing ? max(out_ch * hidden_mult, 64) : Int(hidden)
+    hdim >= 1 || throw(ArgumentError("hidden must be ≥ 1, got $hdim"))
     mlp = Chain(
-        Dense(in_dim, hidden, relu),
-        Dense(hidden, out_dim),
+        Dense(in_dim, hdim, relu),
+        Dense(hdim, out_dim),
     )
     return MTInputProjector{typeof(mlp)}(
         n_stations, n_periods, in_channels, out_h, out_w, out_ch, mlp,
@@ -397,7 +429,8 @@ end
 """
     MTResistivityUNet2D(;
         in_channels=2,
-        base_channels=16,
+        base_channels=32,
+        n_down=3,
         reduction=4,
         spatial_kernel=3,
         logres_min=0.0f0,
@@ -405,13 +438,18 @@ end
         mesh=DEFAULT_MESH,
     )
 
-# Architecture
-1. **Input projection** — `(n_stations, n_periods, C_in)` MT tensor → coarse
-   `(nz_b, nx_b, 4·base)` spatial bottleneck (replaces volumetric encoder input).
-2. **Bottleneck** — `DoubleConv2D → CBAM2D` at `4·base` channels.
-3. **Decoder (×2)** — `ConvTranspose2D` upsample, `DoubleConv2D`.
-4. **Head** — `1×1` conv → sigmoid-scaled ``\\log_{10}\\rho`` in
-   ``[\\mathrm{logres\\_min}, \\mathrm{logres\\_max}]``.
+# Architecture (`n_down=3`, default v5)
+1. **Input projection** — `(n_stations, n_periods, C_in)` → `(nz/4, nx/4, 2·base)`
+   with a Dense hidden width scaled to the wide mesh (floor 512).
+2. **Encoder (×1)** — `DoubleConv2D → CBAM2D` skip, stride-2 down to
+   `(nz/8, nx/8, 8·base)`.
+3. **Bottleneck** — `DoubleConv2D → CBAM2D` at `8·base` channels.
+4. **Decoder (×3)** — upsample; first stage fuses the encoder skip; CBAM on
+   every decoder scale.
+5. **Head** — `1×1` conv → sigmoid-scaled ``\\log_{10}\\rho``.
+
+`n_down=2` is the v1–v4 layout (project to `4·base` at `/4`, bottleneck, two
+decoders, no encoder) so older checkpoints still load.
 
 # Forward
 `(model)(x, ps, st) -> (logres, st′)`
@@ -419,26 +457,30 @@ end
 - `x`: `(n_stations, n_periods, C_in, B)` or 3-D without batch
 - `logres`: `(nz, nx, B)` or `(nz, nx)` — log10 resistivity (Ω·m)
 """
-struct MTResistivityUNet2D{P,B,D1,D2,H} <: Lux.AbstractLuxContainerLayer{
-    (:projector, :bottleneck, :dec1, :dec2, :head)
+struct MTResistivityUNet2D{P,E,B,D1,D2,D3,H} <: Lux.AbstractLuxContainerLayer{
+    (:projector, :enc1, :bottleneck, :dec1, :dec2, :dec3, :head)
 }
     mesh::MeshParams
     in_channels::Int
     base_channels::Int
+    n_down::Int
     logres_min::Float32
     logres_max::Float32
     nz_bottleneck::Int
     nx_bottleneck::Int
     projector::P
+    enc1::E
     bottleneck::B
     dec1::D1
     dec2::D2
+    dec3::D3
     head::H
 end
 
 function MTResistivityUNet2D(;
                              in_channels::Int=2,
-                             base_channels::Int=16,
+                             base_channels::Int=32,
+                             n_down::Int=3,
                              reduction::Int=4,
                              spatial_kernel::Int=3,
                              logres_min::Float32=0.0f0,
@@ -447,28 +489,45 @@ function MTResistivityUNet2D(;
     mesh = validate_mesh_params(mesh)
     in_channels >= 1 || throw(ArgumentError("in_channels must be ≥ 1"))
     base_channels >= 4 || throw(ArgumentError("base_channels must be ≥ 4"))
+    n_down in (2, 3) || throw(ArgumentError("n_down must be 2 or 3, got $n_down"))
     logres_max > logres_min || throw(ArgumentError("logres_max must exceed logres_min"))
 
     c1 = base_channels
     c2 = 2 * base_channels
     c4 = 4 * base_channels
+    c8 = 8 * base_channels
 
-    nz_b, nx_b = _downsample_spatial(mesh.nz, mesh.nx, 2)
-
+    # Project to /4 so the Dense out_dim stays ~12×30×64 when base=32, n_down=3
+    # (same as v4's 12×30×64 at base=16). Hidden width grows with n_down.
+    nz_p, nx_p = _downsample_spatial(mesh.nz, mesh.nx, 2)
+    proj_ch = n_down >= 3 ? c2 : c4
+    proj_hidden = n_down >= 3 ? max(proj_ch * 4, 512) : nothing
     projector = MTInputProjector(
-        mesh.n_stations, n_periods(mesh), nz_b, nx_b, c4;
-        in_channels=in_channels,
+        mesh.n_stations, n_periods(mesh), nz_p, nx_p, proj_ch;
+        in_channels=in_channels, hidden=proj_hidden,
     )
-    bottleneck = BottleneckStage2D(c4;
-                                   reduction=reduction, spatial_kernel=spatial_kernel)
-    dec1 = DecoderStage2D(c4, 0, c2)
-    dec2 = DecoderStage2D(c2, 0, c1)
+
+    if n_down >= 3
+        enc1 = EncoderStage2D(c2, c4, c8; reduction=reduction, spatial_kernel=spatial_kernel)
+        bottleneck = BottleneckStage2D(c8; reduction=reduction, spatial_kernel=spatial_kernel)
+        dec1 = AttentiveDecoder2D(c8, c4, c4; reduction=reduction, spatial_kernel=spatial_kernel)
+        dec2 = AttentiveDecoder2D(c4, 0, c2; reduction=reduction, spatial_kernel=spatial_kernel)
+        dec3 = AttentiveDecoder2D(c2, 0, c1; reduction=reduction, spatial_kernel=spatial_kernel)
+        nz_b, nx_b = _downsample_spatial(mesh.nz, mesh.nx, 3)
+    else
+        enc1 = EmptyLayer()
+        bottleneck = BottleneckStage2D(c4; reduction=reduction, spatial_kernel=spatial_kernel)
+        dec1 = DecoderStage2D(c4, 0, c2)
+        dec2 = DecoderStage2D(c2, 0, c1)
+        dec3 = EmptyLayer()
+        nz_b, nx_b = nz_p, nx_p
+    end
     head = Conv((1, 1), c1 => 1)
 
-    return MTResistivityUNet2D{typeof(projector),typeof(bottleneck),
-                               typeof(dec1),typeof(dec2),typeof(head)}(
-        mesh, in_channels, base_channels, logres_min, logres_max, nz_b, nx_b,
-        projector, bottleneck, dec1, dec2, head,
+    return MTResistivityUNet2D{typeof(projector),typeof(enc1),typeof(bottleneck),
+                               typeof(dec1),typeof(dec2),typeof(dec3),typeof(head)}(
+        mesh, in_channels, base_channels, n_down, logres_min, logres_max, nz_b, nx_b,
+        projector, enc1, bottleneck, dec1, dec2, dec3, head,
     )
 end
 
@@ -479,27 +538,33 @@ function (m::MTResistivityUNet2D)(x::AbstractArray, ps, st)
 
     x_in = replace_nan(x4)
 
-    # ── MT → coarse spatial bottleneck ───────────────────────────────────────
     h, st_p = m.projector(x_in, ps.projector, st.projector)
 
-    # ── Bottleneck ───────────────────────────────────────────────────────────
-    bot, st_bot = m.bottleneck(h, ps.bottleneck, st.bottleneck)
+    if m.n_down >= 3
+        h, skip1, st_e = m.enc1(h, ps.enc1, st.enc1)
+        bot, st_bot = m.bottleneck(h, ps.bottleneck, st.bottleneck)
+        h_dec, st_d1 = m.dec1(bot, skip1, ps.dec1, st.dec1)
+        h_dec, st_d2 = m.dec2(h_dec, nothing, ps.dec2, st.dec2)
+        h_dec, st_d3 = m.dec3(h_dec, nothing, ps.dec3, st.dec3)
+        st_new = (;
+            projector=st_p, enc1=st_e, bottleneck=st_bot,
+            dec1=st_d1, dec2=st_d2, dec3=st_d3, head=nothing,
+        )
+    else
+        bot, st_bot = m.bottleneck(h, ps.bottleneck, st.bottleneck)
+        h_dec, st_d1 = m.dec1(bot, nothing, ps.dec1, st.dec1)
+        h_dec, st_d2 = m.dec2(h_dec, nothing, ps.dec2, st.dec2)
+        st_new = (;
+            projector=st_p, bottleneck=st_bot,
+            dec1=st_d1, dec2=st_d2, head=nothing,
+        )
+    end
 
-    # ── Decoder (upsample; no encoder skips on MT path) ──────────────────────
-    h_dec, st_d1 = m.dec1(bot, nothing, ps.dec1, st.dec1)
-    h_dec, st_d2 = m.dec2(h_dec, nothing, ps.dec2, st.dec2)
-
-    # ── Pad/crop to exact mesh resolution ────────────────────────────────────
     h_up = _pad_hw(h_dec, m.mesh.nz, m.mesh.nx)
 
-    # ── Log-resistivity head ─────────────────────────────────────────────────
     logits, st_head = m.head(h_up, ps.head, st.head)
     logres = _scale_log_resistivity(logits[:, :, 1, :], m.logres_min, m.logres_max)
-
-    st_new = (;
-        projector=st_p, bottleneck=st_bot,
-        dec1=st_d1, dec2=st_d2, head=st_head,
-    )
+    st_new = merge(st_new, (; head=st_head))
 
     if squeezed
         logres = dropdims(logres; dims=3)
@@ -511,8 +576,47 @@ function Base.show(io::IO, m::MTResistivityUNet2D)
     c = m.base_channels
     print(io, "MTResistivityUNet2D(mesh=$(m.mesh.nz)×$(m.mesh.nx)",
           ", C_in=", m.in_channels,
-          ", base=", c, "→", 2c, "→", 4c,
+          ", n_down=", m.n_down,
+          ", base=", c, "→", 2c, "→", 4c, (m.n_down >= 3 ? "→$(8c)" : ""),
           ", log10ρ∈[", m.logres_min, ",", m.logres_max, "])")
+end
+
+"""Recursively count scalar parameters in a Lux parameter tree."""
+function count_parameters(ps)::Int
+    if ps isa AbstractArray
+        return length(ps)
+    elseif ps isa NamedTuple || ps isa Tuple
+        n = 0
+        for x in ps
+            n += count_parameters(x)
+        end
+        return n
+    else
+        n = 0
+        for f in fieldnames(typeof(ps))
+            n += count_parameters(getfield(ps, f))
+        end
+        return n
+    end
+end
+
+"""
+    report_capacity_change(mesh; rng) -> NamedTuple
+
+Parameter counts for the v4 layout (`base=16`, `n_down=2`) vs v5
+(`base=32`, `n_down=3`) on `mesh`.
+"""
+function report_capacity_change(mesh::MeshParams=DEFAULT_MESH;
+                                rng::AbstractRNG=Random.default_rng(),
+                                in_channels::Int=2)
+    old = MTResistivityUNet2D(; in_channels, base_channels=16, n_down=2, mesh)
+    new = MTResistivityUNet2D(; in_channels, base_channels=32, n_down=3, mesh)
+    ps_old, _ = Lux.setup(rng, old)
+    ps_new, _ = Lux.setup(rng, new)
+    n_old = count_parameters(ps_old)
+    n_new = count_parameters(ps_new)
+    return (; n_old, n_new, ratio=n_new / max(n_old, 1),
+            old_model=old, new_model=new)
 end
 
 """
@@ -535,13 +639,14 @@ end
 Forward pass on random MT data; returns `true` when all checks pass.
 """
 function run_smoke_test(;
-                        mesh::MeshParams=DEFAULT_MESH,
+                        mesh::MeshParams=UNET_MESH,
                         in_channels::Int=2,
                         batch_size::Int=2,
-                        base_channels::Int=16,
+                        base_channels::Int=32,
+                        n_down::Int=3,
                         rng::AbstractRNG=Random.default_rng())::Bool
     mesh = validate_mesh_params(mesh)
-    model = MTResistivityUNet2D(; in_channels, base_channels, mesh)
+    model = MTResistivityUNet2D(; in_channels, base_channels, n_down, mesh)
     ps, st = Lux.setup(rng, model)
 
     S = mesh.n_stations
@@ -567,8 +672,12 @@ function run_smoke_test(;
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    @assert run_smoke_test()
+    @assert run_smoke_test(; n_down=3, base_channels=32)
+    @assert run_smoke_test(; n_down=2, base_channels=16)
+    cap = report_capacity_change(UNET_MESH)
     println("MTResistivityUNet2D smoke test passed.")
+    println("  params v4 (base=16, n_down=2): ", cap.n_old)
+    println("  params v5 (base=32, n_down=3): ", cap.n_new, "  (×", round(cap.ratio; digits=2), ")")
 end
 
 end # module MTResistivityUNet2DLayers

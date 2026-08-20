@@ -26,6 +26,10 @@ using .ExportPriorToMTGeophysics
 
 generate_prior("obs/site.h5", "models/best_mt_resistivity_prior.jld2",
                "output/prior_start.ini")
+# or a raw field survey (.obs / stations+periods+data) — resampled internally
+generate_prior("examples/0COMEMI2D-I/Comemi2D1.obs",
+               "models/best_mt_resistivity_prior.jld2",
+               "output/prior_start.ini")
 ```
 
 The returned path is ready for `VFSA2DMTParams(start_model_path = ...)`.
@@ -36,17 +40,19 @@ using JLD2
 using HDF5
 using Printf
 using Statistics
+using MTGeophysics
 
 const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 
-include(joinpath(ROOT, "src", "synthetic", "MeshParams.jl"))
+include(joinpath(ROOT, "src", "synthetic", "MTInputStandardizer.jl"))
 include(joinpath(ROOT, "src", "networks", "mt_resistivity_unet2d.jl"))
 
-using .MTMeshParams: MeshParams, DEFAULT_MESH, n_periods, validate_mesh_params, frequencies_hz
 using .MTResistivityUNet2DLayers: MTResistivityUNet2D, replace_nan, add_batch_dim
+using .MTResistivityUNet2DLayers.MTMeshParams: MeshParams, DEFAULT_MESH, n_periods, validate_mesh_params, frequencies_hz
+using .MTInputStandardizer: standardize_mt_input, pack_te_response
 
 export load_trained_model, predict_prior, write_ini_prior, generate_prior
-export load_mt_observations
+export load_mt_observations, standardize_mt_input, pack_te_response
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model loading
@@ -57,14 +63,53 @@ export load_mt_observations
 
 Load a trained `MTResistivityUNet2D` checkpoint (JLD2) written by
 `train_mt_resistivity.jl`.
+
+JLD2 may reconstruct custom structs as `ReconstructedStatic` when loaded in a
+different module context. We extract scalar fields and rebuild the model and
+`MeshParams` from scratch to avoid type mismatches.
 """
 function load_trained_model(checkpoint_path::String)
     isfile(checkpoint_path) || error("Checkpoint not found: $checkpoint_path")
     ckpt = load(checkpoint_path)
-    model = ckpt["model"]::MTResistivityUNet2D
-    ps    = ckpt["ps"]
-    st    = ckpt["st"]
-    mp    = get(ckpt, "mesh_params", DEFAULT_MESH)::MeshParams
+
+    ps = ckpt["ps"]
+    st = ckpt["st"]
+
+    # Rebuild MeshParams from checkpoint (may be a ReconstructedMutable)
+    raw_mp = get(ckpt, "mesh_params", nothing)
+    mp = if raw_mp isa MeshParams
+        raw_mp
+    elseif raw_mp !== nothing
+        MeshParams(
+            Int(raw_mp.nx), Int(raw_mp.nz),
+            Float64(raw_mp.dx), Float64(raw_mp.dz),
+            Int(raw_mp.n_stations),
+            Float64.(collect(raw_mp.periods)),
+        )
+    else
+        DEFAULT_MESH
+    end
+
+    # Rebuild model from config (may be a ReconstructedStatic)
+    raw_model = ckpt["model"]
+    model = if raw_model isa MTResistivityUNet2D
+        raw_model
+    else
+        n_down = try
+            Int(raw_model.n_down)
+        catch
+            :enc1 in propertynames(ps) ? 3 : 2
+        end
+        MTResistivityUNet2D(;
+            in_channels = Int(raw_model.in_channels),
+            base_channels = Int(raw_model.base_channels),
+            n_down = n_down,
+            logres_min = Float32(raw_model.logres_min),
+            logres_max = Float32(raw_model.logres_max),
+            mesh = mp,
+        )
+    end
+
     return model, ps, st, mp
 end
 
@@ -231,7 +276,9 @@ function load_mt_observations(path::String; mp::Union{Nothing,MeshParams}=nothin
     h5open(path, "r") do f
         if haskey(f, "X")
             x = Float32.(read(f["X"]))
-            ndims(x) == 4 && size(x, 4) == 1 && (x = x[:, :, :, 1])
+            if ndims(x) == 4
+                x = x[:, :, :, 1]  # take first sample from dataset
+            end
             return x
         elseif haskey(f, "mt_data")
             x = Float32.(read(f["mt_data"]))
@@ -252,30 +299,82 @@ end
 
 """
     generate_prior(mt_obs_path, checkpoint_path, output_ini_path; kwargs...) -> String
+    generate_prior(raw_stations, raw_periods, raw_data, checkpoint_path, output_ini_path; kwargs...)
 
-End-to-end workflow: load MT observations → predict log10(ρ) prior →
-write `.ini` file ready for `VFSA2DMTParams(start_model_path = ...)`.
+End-to-end workflow: load (or accept) raw MT observations, resample them onto
+the checkpoint survey with [`standardize_mt_input`](@ref), predict log10(ρ)
+prior, write `.ini` ready for `VFSA2DMTParams(start_model_path = ...)`.
 
 # Arguments
-- `mt_obs_path`: HDF5 file with MT response data (see [`load_mt_observations`](@ref))
+- `mt_obs_path`: HDF5 (`load_mt_observations`) **or** MTGeophysics `.obs` file
+- `raw_stations`, `raw_periods`, `raw_data`: field survey; `raw_data` is
+  `(n_stations, n_periods, n_channels)` in training channel order
 - `checkpoint_path`: JLD2 checkpoint from `train_mt_resistivity.jl`
 - `output_ini_path`: destination `.ini` file
 
 # Keyword arguments
-Forwarded to [`write_ini_prior`](@ref) (padding, air cells, title, etc.).
-
-# Returns
-The absolute path to the written `.ini` file.
+- `method`: `:bilinear` (default) or `:nearest` resampling
+- `stations`, `periods`: required when an HDF5 tensor is not already on the
+  checkpoint grid
+- remaining kwargs are forwarded to [`write_ini_prior`](@ref)
 """
 function generate_prior(mt_obs_path::String,
                         checkpoint_path::String,
                         output_ini_path::String;
+                        method::Symbol=:bilinear,
+                        stations=nothing,
+                        periods=nothing,
                         kwargs...)
     model, ps, st, mp = load_trained_model(checkpoint_path)
-    mt_data = load_mt_observations(mt_obs_path; mp=mp)
+    mt_data = _load_and_standardize(mt_obs_path, mp; method=method,
+                                    stations=stations, periods=periods)
     logres = predict_prior(model, ps, st, mt_data)
     write_ini_prior(logres, output_ini_path, mp; kwargs...)
     return abspath(output_ini_path)
+end
+
+function generate_prior(raw_stations::AbstractVector,
+                        raw_periods::AbstractVector,
+                        raw_data::AbstractArray{<:Real,3},
+                        checkpoint_path::String,
+                        output_ini_path::String;
+                        method::Symbol=:bilinear,
+                        kwargs...)
+    model, ps, st, mp = load_trained_model(checkpoint_path)
+    mt_data = standardize_mt_input(raw_stations, raw_periods, raw_data;
+                                   mp=mp, method=method)
+    logres = predict_prior(model, ps, st, mt_data)
+    write_ini_prior(logres, output_ini_path, mp; kwargs...)
+    return abspath(output_ini_path)
+end
+
+function _looks_like_obs(path::AbstractString)::Bool
+    ext = lowercase(splitext(path)[2])
+    return ext in (".obs", ".dat", ".edi")
+end
+
+function _mt_tensor_from_obs(path::AbstractString, mp; method::Symbol=:bilinear)
+    data = MTGeophysics.load_data2d(path)
+    return standardize_mt_input(data; mp=mp, method=method)
+end
+
+"""Load HDF5 / `.obs` and resample onto `mp` when the survey is not canonical."""
+function _load_and_standardize(path::String, mp;
+                               method::Symbol=:bilinear,
+                               stations=nothing,
+                               periods=nothing)::Array{Float32,3}
+    if _looks_like_obs(path)
+        return _mt_tensor_from_obs(path, mp; method=method)
+    end
+
+    x = load_mt_observations(path; mp=mp)
+    nS, nP = Int(mp.n_stations), length(mp.periods)
+    if size(x, 1) == nS && size(x, 2) == nP
+        return x
+    end
+    stations === nothing && periods === nothing &&
+        error("MT tensor size $(size(x)) ≠ canonical ($nS, $nP, ·); pass stations and periods, or provide a .obs file")
+    return standardize_mt_input(stations, periods, x; mp=mp, method=method)
 end
 
 end # module ExportPriorToMTGeophysics

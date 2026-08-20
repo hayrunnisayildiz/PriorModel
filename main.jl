@@ -17,9 +17,7 @@ Pipeline:
   3. HDF5 export                 → data/processed/resistivity_prior_results.h5
 =#
 
-using Pkg
 include(joinpath(@__DIR__, "src", "pkg_setup.jl"))
-activate_project!(@__DIR__)
 
 # Load LuxCUDA (CUDA + cuDNN) before Lux network includes (Julia 1.12 world-age).
 try
@@ -34,8 +32,6 @@ using Printf
 using HDF5
 using JLD2
 using Lux
-
-const ROOT = @__DIR__
 
 include(joinpath(ROOT, "src", "gpu_utils.jl"))
 GPUUtils.init_cuda!()

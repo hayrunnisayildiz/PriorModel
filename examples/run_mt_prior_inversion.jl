@@ -9,6 +9,10 @@ Usage (from project root):
         --data     examples/0COMEMI2D-I/Comemi2D1.obs \
         --output   results/prior_inversion
 
+Colab (cwd is /content — never `--project=.` from there):
+    julia --project=/content/PriorModel \
+        /content/PriorModel/examples/run_mt_prior_inversion.jl
+
 Steps:
   1. Load MT observations, predict neural prior via MTResistivityUNet2D
   2. Write prior as .ini start-model for MTGeophysics.jl
@@ -17,9 +21,7 @@ Steps:
   5. Plot side-by-side comparison
 =#
 
-using Pkg
-const ROOT = normpath(joinpath(@__DIR__, ".."))
-Pkg.activate(ROOT)
+include(joinpath(@__DIR__, "..", "src", "pkg_setup.jl"))
 
 using Printf
 using Dates
@@ -108,7 +110,82 @@ function write_halfspace_ini(output_path::String, checkpoint_path::String;
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Comparison plot
+# Result extraction helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""Extract final misfit, iteration count, and per-iteration misfit curve from a VFSA result."""
+function _extract_metrics(result)
+    ri = result.run_info
+
+    final_misfit = if hasproperty(ri, :best_rms)
+        ri.best_rms
+    elseif hasproperty(ri, :best_misfit)
+        ri.best_misfit
+    elseif hasproperty(result, :summary) && hasproperty(result.summary, :best_rms)
+        result.summary.best_rms
+    else
+        nothing
+    end
+
+    n_iter = if hasproperty(ri, :iterations_used)
+        ri.iterations_used
+    elseif hasproperty(ri, :n_iterations)
+        ri.n_iterations
+    elseif hasproperty(ri, :total_iterations)
+        ri.total_iterations
+    else
+        nothing
+    end
+
+    misfit_curve = if hasproperty(ri, :misfit_history)
+        Float64.(ri.misfit_history)
+    elseif hasproperty(ri, :rms_history)
+        Float64.(ri.rms_history)
+    elseif hasproperty(result, :chain_results)
+        # Take the best chain's history
+        best = argmin(cr -> something(
+            hasproperty(cr, :best_rms) ? cr.best_rms : nothing,
+            hasproperty(cr, :best_misfit) ? cr.best_misfit : nothing,
+            Inf), result.chain_results)
+        if hasproperty(best, :rms_history)
+            Float64.(best.rms_history)
+        elseif hasproperty(best, :misfit_history)
+            Float64.(best.misfit_history)
+        else
+            nothing
+        end
+    else
+        nothing
+    end
+
+    return (; final_misfit, n_iter, misfit_curve)
+end
+
+function print_inversion_summary(label::String, result)
+    m = _extract_metrics(result)
+    misfit_str = m.final_misfit === nothing ? "N/A" : @sprintf("%.4f", m.final_misfit)
+    iter_str   = m.n_iter === nothing ? "N/A" : string(m.n_iter)
+    @printf("  %-14s  misfit = %s  iterations = %s\n", label * ":", misfit_str, iter_str)
+end
+
+"""Compute how many times faster the prior reaches the halfspace's final misfit."""
+function compute_speedup(halfspace_result, prior_result)
+    mh = _extract_metrics(halfspace_result)
+    mp = _extract_metrics(prior_result)
+
+    mh.final_misfit === nothing && return nothing
+    mp.misfit_curve === nothing && return nothing
+    mh.n_iter === nothing && return nothing
+
+    target = mh.final_misfit
+    idx = findfirst(v -> v <= target, mp.misfit_curve)
+    idx === nothing && return nothing
+
+    return Float64(mh.n_iter) / Float64(idx)
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Comparison plots
 # ─────────────────────────────────────────────────────────────────────────────
 
 function plot_comparison(prior_result, halfspace_result, output_dir::String)
@@ -146,6 +223,43 @@ function plot_comparison(prior_result, halfspace_result, output_dir::String)
     plot_path = joinpath(output_dir, "comparison_prior_vs_halfspace.png")
     CairoMakie.save(plot_path, fig; px_per_unit=2)
     @info "Comparison plot saved" path=plot_path
+    return plot_path
+end
+
+"""Plot misfit convergence curves for both runs overlaid."""
+function plot_convergence(prior_result, halfspace_result, output_dir::String)
+    try
+        @eval using CairoMakie
+    catch
+        @warn "CairoMakie not available; skipping convergence plot"
+        return nothing
+    end
+
+    mp = _extract_metrics(prior_result)
+    mh = _extract_metrics(halfspace_result)
+    (mp.misfit_curve === nothing && mh.misfit_curve === nothing) && return nothing
+
+    fig = CairoMakie.Figure(size=(700, 400))
+    ax = CairoMakie.Axis(fig[1, 1];
+        xlabel="Iteration", ylabel="Misfit (RMS)",
+        title="Convergence: Neural Prior vs Halfspace",
+        yscale=log10,
+    )
+
+    if mh.misfit_curve !== nothing
+        CairoMakie.lines!(ax, 1:length(mh.misfit_curve), mh.misfit_curve;
+            color=:gray60, linewidth=2, label="Halfspace")
+    end
+    if mp.misfit_curve !== nothing
+        CairoMakie.lines!(ax, 1:length(mp.misfit_curve), mp.misfit_curve;
+            color=:dodgerblue, linewidth=2, label="Neural Prior")
+    end
+
+    CairoMakie.axislegend(ax; position=:rt)
+
+    plot_path = joinpath(output_dir, "convergence_prior_vs_halfspace.png")
+    CairoMakie.save(plot_path, fig; px_per_unit=2)
+    @info "Convergence plot saved" path=plot_path
     return plot_path
 end
 
@@ -193,9 +307,26 @@ function main(cfg::RunConfig=RunConfig())
     )
     @info "Halfspace inversion complete" dir=halfspace_result.run_info.run_dir
 
-    # Step 5: Comparison plot
+    # Step 5: Misfit / iteration comparison
+    println("\n", "─" ^ 60)
+    println(" Misfit / Iteration Comparison")
+    println("─" ^ 60)
+    print_inversion_summary("Halfspace", halfspace_result)
+    print_inversion_summary("Neural Prior", prior_result)
+    println("─" ^ 60)
+
+    speedup = compute_speedup(halfspace_result, prior_result)
+    if speedup !== nothing
+        @printf("Prior reached halfspace-equivalent misfit %.1f× faster\n", speedup)
+    end
+
+    # Step 6: Comparison plot
     println("\nGenerating comparison plot...")
     plot_comparison(prior_result, halfspace_result, cfg.output_dir)
+
+    # Step 7: Convergence curve overlay
+    println("Generating convergence plot...")
+    plot_convergence(prior_result, halfspace_result, cfg.output_dir)
 
     println("\n", "═" ^ 60)
     println(" Done. Results in: $(cfg.output_dir)")
