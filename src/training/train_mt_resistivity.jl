@@ -58,6 +58,14 @@ using .MTInputStandardizer: standardize_mt_input
 using .CommemiProbe: load_commemi_mt, probe_commemi_rms,
                      should_save_checkpoint, should_probe_epoch
 
+"""Colab `%%bash` block-buffers stdout; flush so epoch lines appear immediately."""
+function _say(args...)
+    println(args...)
+    flush(stdout)
+    flush(stderr)
+    return nothing
+end
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults  (`ROOT` comes from src/pkg_setup.jl)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -683,10 +691,11 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
     start_epoch <= cfg.epochs || error(
         "nothing to do: resume starts at epoch $start_epoch but --epochs=$(cfg.epochs)")
 
-    println("═" ^ 60)
-    println(" MTResistivityUNet2D training — synthetic MT pairs")
-    println("═" ^ 60)
-    println("  Device: ", device_label(use_gpu))
+    _say("═" ^ 60)
+    _say(" MTResistivityUNet2D training — synthetic MT pairs")
+    _say("═" ^ 60)
+    _say("  Device: ", device_label(use_gpu))
+    _say("  First epoch compiles CUDA/Zygote kernels; Colab can look frozen for 10–20 min.")
     if resuming
         println("  Resume: ", abspath(resume_path),
                 "  (epoch ", resume_ckpt.epoch, " → ", cfg.epochs, ")")
@@ -821,14 +830,15 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
         end
     end
 
-    println("\nStarting training for epochs ", start_epoch, "–", cfg.epochs,
-            "  (cosine horizon=", cosine_n, ")")
+    _say("\nStarting training for epochs ", start_epoch, "–", cfg.epochs,
+         "  (cosine horizon=", cosine_n, ")")
     @printf("  N=%d  train=%d  val=%d  batch=%d  clip_norm=%.2f\n",
             N, length(train_idx), length(val_idx), cfg.batch_size, cfg.clip_norm)
     @printf("  λ_data=%.2e  λ_tv=%.2e  lr_max=%.2e  (cosine annealing)\n",
             λ_data, λ_tv, cfg.lr)
     println("  checkpoint selection: commemi_rms (primary) / val_loss (fallback) → ",
             cfg.output)
+    flush(stdout)
     if resuming
         η_prev = cosine_annealing_lr(resume_epoch, cosine_n, cfg.lr)
         η_next = cosine_annealing_lr(start_epoch, cosine_n, cfg.lr)
@@ -836,9 +846,11 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
                 resume_epoch, η_prev, start_epoch, η_next)
     end
 
+    first_step_logged = false
     for epoch in start_epoch:cfg.epochs
         η = cosine_annealing_lr(epoch, cosine_n, cfg.lr)
         Optimisers.adjust!(opt_state, η)
+        _say(@sprintf("  epoch %d/%d starting (lr=%.3e) …", epoch, cfg.epochs, η))
 
         epoch_total = 0.0f0
         epoch_data  = 0.0f0
@@ -849,6 +861,10 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
             xb, yb = sample_batch(X, Y, idx)
             terms, st = train_step!(model, ps, st, opt_state, xb, yb, use_gpu;
                                     λ_data=λ_data, λ_tv=λ_tv)
+            if !first_step_logged
+                _say("  first GPU train step finished (compile done)")
+                first_step_logged = true
+            end
             bsz = length(idx)
             epoch_total += Float32(terms.total) * Float32(bsz)
             epoch_data  += Float32(terms.data)  * Float32(bsz)
@@ -891,6 +907,8 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
             @printf("Epoch %3d/%d  lr=%.3e  train=%.6e  val=%.6e  L_data=%.6e  L_TV=%.6e\n",
                     epoch, cfg.epochs, η, avg_train, avg_val, avg_data, avg_tv)
         end
+        flush(stdout)
+        flush(stderr)
 
         push!(log_epochs, epoch)
         push!(log_train, avg_train)

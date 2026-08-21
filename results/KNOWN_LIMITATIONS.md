@@ -98,10 +98,10 @@ güvenilir korelasyon göstermiyor.
 
 Full nine-way table: `results/evaluate_v6/comparison.txt`.
 
-## v7 — n=1000, COMMEMI-family scenarios, commemi_rms checkpoint
+## v7 — n=1000, COMMEMI-family scenarios (designed vs Colab run)
 
 v7 treats the v5→v6 mismatch as a training-loop bug, not just a data-size
-issue:
+issue. **Designed** loop:
 
 1. **Periodic COMMEMI probe.** Every 10 epochs a short VFSA (25 iter, not 100)
    runs on COMMEMI 2-D-I; `commemi_rms` is logged next to `val_loss`.
@@ -113,5 +113,46 @@ issue:
    sizes/resistivities, not a copy of the benchmark.
 4. **Scale.** `n=1000` pairs, 50 epochs → `models/production_prior_v7.jld2`.
 
-Training curve (val_loss + commemi_rms, dual axis): `results/training_curve_v7.png`.
-Ten-way table: `results/evaluate_v7/comparison.txt`.
+### What actually ran (Colab A100, 21 Aug 2026)
+
+MTGeophysics.jl loads GLMakie at package init, so the COMMEMI probe cannot run
+on headless Colab. Training used `--commemi-every 0 --no-plot`. Checkpoint is
+**val_loss fallback** (best at epoch 50), not `commemi_rms`.
+
+| | |
+|---|---|
+| Data | `train_pairs_v7.h5`, N=1000, 30×20, mesh 48×120 |
+| Device | NVIDIA A100-SXM4-80GB, `CUDA.functional()=true` |
+| Split | 800/200, seed=42 |
+| U-Net | `base_channels=32`, `n_down=3`, 15 689 336 params (v5 layout) |
+| Train | 50 epochs, cosine LR `2e-4 → 1e-5`, batch=16 |
+| Synthetic loss | train `0.978 → 0.211`, val `0.797 → 0.320` |
+| Last-5 val slope | `−1.3×10⁻⁴` (almost plateau; mild train/val gap) |
+| Checkpoint | `models/production_prior_v7.jld2` (copied from Colab `best_mt_resistivity_prior.jld2`) |
+
+This is **v7 data + v5-style val_loss checkpoint**, not the designed
+`commemi_rms` loop.
+
+### COMMEMI VFSA (same settings as v4–v6)
+
+`T_ood=false`, `x_ood=0/11`. Ten-way table: `results/evaluate_v7/comparison.txt`.
+
+| Start model | initial RMS | best RMS |
+|---|---|---|
+| Homogeneous | 12.31 | **5.7354** |
+| U-Net v5 (400/35ep, val ckpt) | 39.86 | **11.8539** |
+| U-Net v6 (400/60ep, v5 resume) | 37.43 | 13.3179 |
+| U-Net v7 Colab (1000/50ep, val ckpt) | 38.56 | **12.4032** |
+
+v7 vs homogeneous: Δbest = **+6.67** (did not beat 5.74).
+v7 vs v5: Δbest = **+0.55** (slightly worse than 11.85).
+v7 vs v6: Δbest = **−0.91** (better than 13.32 — the extra-epoch trap did not
+fully repeat).
+
+**Yorum:** n=1000 + COMMEMI-family senaryolar, val_loss checkpoint ile
+homojeni veya v5’i geçmedi. Kapsama sorunu değil (`T`/`x` in-distribution).
+Sentetik val `0.32` yine COMMEMI RMS ile hizalanmadı. Designed v7
+(`--commemi-every 10`) henüz koşulmadı; 50+ epoch yok. Geniş-mesh U-Net’te
+en iyi COMMEMI hâlâ v5 (`11.85`).
+
+Training curve PNG was skipped (`--no-plot`). CSV: `results/training_log.csv`.
