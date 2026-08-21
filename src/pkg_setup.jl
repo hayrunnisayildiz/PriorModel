@@ -14,12 +14,25 @@
 
 const ROOT = dirname(@__DIR__)
 
+using Logging
 using Pkg
 
 function _is_colab()::Bool
     return isdir("/content") ||
            haskey(ENV, "COLAB_RELEASE_TAG") ||
            haskey(ENV, "COLAB_GPU")
+end
+
+function _flush_io()
+    flush(stdout)
+    flush(stderr)
+    return nothing
+end
+
+"""True when the project is activated and a required dep is already loadable."""
+function _project_ready(root::AbstractString)::Bool
+    isfile(joinpath(root, "Manifest.toml")) || return false
+    return Base.find_package("HDF5") !== nothing
 end
 
 """
@@ -49,12 +62,22 @@ function activate_project!(root::AbstractString=ROOT)
     get!(ENV, "GKSwstype", "nul")
     if _is_colab()
         get!(ENV, "JULIA_PKG_PRECOMPILE_AUTO", "0")
+        # stderr is unbuffered; Colab %%bash otherwise looks frozen during instantiate.
+        global_logger(ConsoleLogger(stderr))
     end
 
     Pkg.activate(root)
-    Pkg.resolve()
-    Pkg.instantiate()
-    Pkg.activate(root)
+    force_instantiate = get(ENV, "PRIORMODEL_FORCE_INSTANTIATE", "0") == "1"
+    if _project_ready(root) && !force_instantiate
+        @info "Project already instantiated; skipping Pkg.resolve/instantiate" project=root
+        _flush_io()
+    else
+        @info "Pkg.resolve + instantiate (can take several minutes; no output is normal)" project=root
+        _flush_io()
+        Pkg.resolve()
+        Pkg.instantiate()
+        Pkg.activate(root)
+    end
 
     active = Base.active_project()
     active_dir = active === nothing ? nothing : rstrip(normpath(dirname(abspath(active))), '/')
@@ -63,6 +86,7 @@ function activate_project!(root::AbstractString=ROOT)
         error("Active project is $(repr(active)), expected $project_toml (pwd=$(pwd())). Start Julia with: julia --project=$root")
     end
     @info "Project ready" project=active pwd=pwd() julia=string(VERSION)
+    _flush_io()
     return root
 end
 

@@ -46,8 +46,12 @@ julia --version
 ### 2. Clone and Drive mount
 
 ```bash
-git clone https://github.com/hayrunnisayildiz/PriorModel.git /content/PriorModel
+export GIT_TERMINAL_PROMPT=0
+git -c credential.helper= clone --depth 1 --single-branch --branch master \
+  https://github.com/hayrunnisayildiz/PriorModel.git /content/PriorModel
 ```
+
+Do not let `git` prompt for a username: a public HTTPS clone waiting on credentials is the usual reason the Colab cell never finishes. If clone still stalls, download the public zip from the same URL (`…/archive/refs/heads/master.zip`). The notebook cell does that automatically after 90 s.
 
 Mount Drive from a Python cell (`from google.colab import drive; drive.mount('/content/drive')`)
 and keep artifacts under `/content/drive/MyDrive/PriorModel/` with the same
@@ -65,12 +69,15 @@ If `/content/Project.toml` already exists, delete it.
 
 ### 3. Data and checkpoints
 
-`data/synthetic/*.h5` and `models/*.jld2` are gitignored (they are large). Fetch
-them from Drive or generate a small synthetic set:
+`data/synthetic/*.h5` and `models/*.jld2` are gitignored (they are large). Copy
+them from Drive with the notebook Python cell (not Julia). On Colab do **not**
+synthesize with `--n 50`: that loads MTGeophysics → GLMakie and the cell hangs.
 
-```bash
-julia --project=/content/PriorModel /content/PriorModel/scripts/colab_fetch_or_build.jl --n 50
-```
+Drive layout on this account (nested):
+
+`MyDrive/PriorModelData/PriorModel/PriorModel/data/synthetic/`
+
+Copy `train_pairs_v7.h5` for training. The 5 MB `train_pairs.h5` is only a smoke test.
 
 ### 4. Train (headless)
 
@@ -82,7 +89,7 @@ and skip the training-curve PNG:
 ```bash
 julia --project=/content/PriorModel \
   /content/PriorModel/src/training/train_mt_resistivity.jl \
-  --dataset /content/PriorModel/data/synthetic/train_pairs.h5 \
+  --dataset /content/PriorModel/data/synthetic/train_pairs_v7.h5 \
   --commemi-every 0 --no-plot
 ```
 
