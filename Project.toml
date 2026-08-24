@@ -30,6 +30,14 @@ LuxCUDA = "0.3"
 MTGeophysics = "0.4.2"
 julia = "1.11"
 
+# Test is a stdlib; listed so `julia --project=. test/runtests.jl` documents
+# the suite even though this repo is not a Pkg.jl package (no name/uuid).
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
+
 # [sources] requires Julia 1.11+. Pin to the tag matching the previously
 # developed local checkout (Manifest reported 0.4.2). v0.5.0 on `main` is a
 # breaking 3D-API release; 2D VFSA2DMT used here is the 0.4.2 surface.
