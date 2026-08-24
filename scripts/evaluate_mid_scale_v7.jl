@@ -9,6 +9,8 @@ finding: val_loss 0.457→0.438 but COMMEMI best RMS 11.85→13.32.
 
 Usage (from project root):
     julia --project=. scripts/evaluate_mid_scale_v7.jl
+    julia --project=. scripts/evaluate_mid_scale_v7.jl \
+        models/production_prior_v7_commemi.jld2 results/evaluate_v7_commemi
 
 Colab (cwd is /content — never `--project=.` from there):
     julia --project=/content/PriorModel /content/PriorModel/scripts/evaluate_mid_scale_v7.jl
@@ -329,10 +331,12 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 
 function main()
-    checkpoint   = joinpath(ROOT, "models", "production_prior_v7.jld2")
+    checkpoint   = length(ARGS) >= 1 ? abspath(ARGS[1]) :
+                   joinpath(ROOT, "models", "production_prior_v7.jld2")
+    results_dir  = length(ARGS) >= 2 ? abspath(ARGS[2]) :
+                   joinpath(ROOT, "results", "evaluate_v7")
     vfsa_data    = joinpath(ROOT, "examples", "0COMEMI2D-I", "Comemi2D1.obs")
     true_model   = joinpath(ROOT, "examples", "0COMEMI2D-I", "Comemi2D1.true")
-    results_dir  = joinpath(ROOT, "results", "evaluate_v7")
     mkpath(results_dir)
 
     isfile(checkpoint) || error("v7 checkpoint not found: $checkpoint")
@@ -342,9 +346,11 @@ function main()
     println("═" ^ 88)
     println(" Production v7 Evaluation: U-Net (1000/50ep, COMMEMI-family scenarios, commemi_rms ckpt)")
     println("═" ^ 88)
+    println("  checkpoint: ", checkpoint)
+    println("  results:    ", results_dir)
 
     # ── Step 1: COMMEMI MT → prior .ini ──────────────────────────────────────
-    println("\n[1/4] Generating COMMEMI prior from production_prior_v7.jld2...")
+    println("\n[1/4] Generating COMMEMI prior from ", basename(checkpoint), "...")
     model, ps, st, mp = load_trained_model(checkpoint)
     n_params = count_parameters(ps)
     cap = report_capacity_change(mp)
@@ -398,7 +404,7 @@ function main()
     table_path = joinpath(results_dir, "comparison.txt")
     open(table_path, "w") do io
         println(io, "Ten-way COMMEMI RMS comparison (1 chain, 200 ctrl, 100 iter, seed=20260308)")
-        println(io, "v7 checkpoint: models/production_prior_v7.jld2")
+        println(io, "v7 checkpoint: $checkpoint")
         println(io, "VFSA run_dir:  $run_dir")
         println(io, "T_ood (COMMEMI ⊂ eğitim T): $T_ood")
         println(io, "x_ood (COMMEMI ⊂ eğitim x): $x_ood/$(length(src_x))")

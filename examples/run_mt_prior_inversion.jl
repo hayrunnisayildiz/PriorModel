@@ -2,6 +2,9 @@
 #=
 End-to-end example: neural MT prior → VFSA2DMT inversion → comparison plot.
 
+Canonical E2E script. Repo-root `main.jl` includes this file and calls `main()`.
+Keep the `PROGRAM_FILE` guard at the bottom so both entry points work.
+
 Usage (from project root):
     julia --project=. examples/run_mt_prior_inversion.jl \
         --mt-obs   obs/site.h5 \

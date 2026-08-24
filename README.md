@@ -4,6 +4,11 @@ MT apparent-resistivity / phase curves → 2-D log₁₀ρ prior, then VFSA2DMT
 (`MTGeophysics.jl`) inversion. Lux.jl U-Net (`MTResistivityUNet2D`) is trained
 on synthetic TE/TM pairs generated on [`UNET_MESH`](src/synthetic/MeshParams.jl).
 
+`main.jl` is a thin wrapper around
+[`examples/run_mt_prior_inversion.jl`](examples/run_mt_prior_inversion.jl)
+(neural prior → VFSA2DMT vs homogeneous halfspace). The 3-D Keivitsa U-Net
+line is frozen under [`archive/3d_keivitsa/`](archive/3d_keivitsa/README_3D_ARCHIVE.md).
+
 ## Pipeline
 
 1. `scripts/build_train_pairs.jl` — synthetic resistivity + forward MT → HDF5
@@ -12,6 +17,8 @@ on synthetic TE/TM pairs generated on [`UNET_MESH`](src/synthetic/MeshParams.jl)
    `commemi_rms` (synthetic `val_loss` is fallback).
 3. `src/inference/export_prior_to_mtgeophysics.jl` — COMMEMI `.obs` → prior `.ini`
 4. `scripts/evaluate_mid_scale_v*.jl` — VFSA2DMT vs homogeneous / previous priors
+5. `julia --project=. main.jl` — E2E: prior `.ini` + VFSA (delegates to
+   `examples/run_mt_prior_inversion.jl`; same CLI flags)
 
 Canonical survey (v4+): 30 stations × 20 periods, `T ∈ [10⁻³, 10³]` s,
 profile 120 × 160 m (19.2 km) so COMMEMI `±8000` m is in-distribution.
