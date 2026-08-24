@@ -14,7 +14,10 @@ before `predict_prior` / `generate_prior` whenever the observed survey differs.
 [`MTMeshParams.MT_DATA_LAYOUT`](@ref):
 - `[:, :, 1] = log10(ρ_a)` (TE `rho_xy` unless the caller stacked TM too)
 - `[:, :, 2] = phase` (degrees)
-- extra channels (TE/TM joint, 4-component) are interpolated independently
+- TE+TM joint layout [`MTMeshParams.MT_DATA_LAYOUT_TETM`](@ref) via
+  [`pack_tetm_response`](@ref): `[log10_ρ_TE, phase_TE, log10_ρ_TM, phase_TM]`.
+  TM phase is folded to `[0, 90]` (same convention as TE); extra channels are
+  interpolated independently
 
 Interpolation is bilinear in `(station x [m], log10(period [s]))`. Queries
 outside the observed range are clamped to the boundary value (edge repeat)
@@ -28,7 +31,8 @@ if !isdefined(@__MODULE__, :MTMeshParams)
 end
 using .MTMeshParams: MeshParams, DEFAULT_MESH, UNET_MESH, n_periods, station_positions
 
-export standardize_mt_input, pack_te_response
+export standardize_mt_input, pack_te_response, pack_tetm_response
+export fold_tm_phase_to_0_90
 export CANONICAL_N_STATIONS, CANONICAL_PERIODS, CANONICAL_MESH
 export canonical_station_positions
 
@@ -152,6 +156,29 @@ function _target_survey(mp)::Tuple{Vector{Float64},Vector{Float64}}
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TM phase convention
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    fold_tm_phase_to_0_90(ϕ) -> Float64
+
+Fold a TM (`Zyx`) phase in degrees onto `[0, 90]`.
+
+`arg(Zyx)` sits near `arg(Zxy) − 180°` because `Zyx ≈ −Zxy`. The 2-D solver
+(`run_mt2d_forward`; `fold_phase=false`) and `load_data2d` both store that raw
+`atan2`. TE stays in `[0, 90]`; without this fold the TM channel is ~180° away
+and incomparable. Formula matches `MTGeophysics._phase_fold_to_0_90`
+(add 180° if negative, then reflect above 90°). Already-folded values in
+`[0, 90]` are unchanged. `NaN` stays `NaN`.
+"""
+function fold_tm_phase_to_0_90(ϕ::Real)::Float64
+    p = Float64(ϕ)
+    isfinite(p) || return p
+    folded = p < 0 ? p + 180.0 : p
+    return folded > 90.0 ? 180.0 - folded : folded
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -170,6 +197,40 @@ function pack_te_response(rho_xy::AbstractMatrix, phase_xy::AbstractMatrix)::Arr
         ρ = Float64(rho_xy[ip, is])
         out[is, ip, 1] = ρ > 0 ? Float32(log10(ρ)) : NaN32
         out[is, ip, 2] = Float32(phase_xy[ip, is])
+    end
+    return out
+end
+
+"""
+    pack_tetm_response(rho_xy, phase_xy, rho_yx, phase_yx) -> Array{Float32,3}
+
+Convert solver-layout TE+TM arrays `(n_periods, n_stations)` into the U-Net
+layout `(n_stations, n_periods, 4)` matching
+[`MTMeshParams.MT_DATA_LAYOUT_TETM`](@ref):
+`[log10_ρ_TE, phase_TE, log10_ρ_TM, phase_TM]`.
+
+TE packing is identical to [`pack_te_response`](@ref); this function does not
+change that 2-channel contract. `ρ ≤ 0` becomes `NaN32` on both modes.
+
+TM phase (`phase_yx`) is passed through [`fold_tm_phase_to_0_90`](@ref) so
+training (`build_train_pairs.jl --tetm`, solver `atan2`) and the COMMEMI probe
+(`load_data2d`) share the same `[0, 90]` convention as TE. Do not fold at the
+call sites — both already go through this packer.
+"""
+function pack_tetm_response(rho_xy::AbstractMatrix, phase_xy::AbstractMatrix,
+                            rho_yx::AbstractMatrix, phase_yx::AbstractMatrix)::Array{Float32,3}
+    te = pack_te_response(rho_xy, phase_xy)
+    size(rho_yx) == size(phase_yx) ||
+        error("rho_yx $(size(rho_yx)) and phase_yx $(size(phase_yx)) differ")
+    size(rho_yx) == size(rho_xy) ||
+        error("TM rho_yx $(size(rho_yx)) differs from TE rho_xy $(size(rho_xy))")
+    nP, nS = size(rho_yx)
+    out = Array{Float32,3}(undef, nS, nP, 4)
+    out[:, :, 1:2] = te
+    @inbounds for is in 1:nS, ip in 1:nP
+        ρ = Float64(rho_yx[ip, is])
+        out[is, ip, 3] = ρ > 0 ? Float32(log10(ρ)) : NaN32
+        out[is, ip, 4] = Float32(fold_tm_phase_to_0_90(phase_yx[ip, is]))
     end
     return out
 end

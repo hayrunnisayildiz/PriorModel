@@ -1,8 +1,13 @@
 #!/usr/bin/env julia
 #=
 Generate train_pairs.h5: (X, Y) pairs where
-  X = MT forward response  (n_stations, n_periods, 2, N)   [log10_rho_app, phase_deg]
+  X = MT forward response  (n_stations, n_periods, n_comp, N)
+      default n_comp=2 TE: [log10_ρ, phase_deg]
+      --tetm    n_comp=4:  [log10_ρ_TE, phase_TE, log10_ρ_TM, phase_TM]
   Y = log10 resistivity     (nz, nx, N)
+
+Default remains TE-only so regenerating v5/v7-style files cannot silently
+become 4-channel. Pass `--tetm` (and a separate `--out` path) for TE+TM.
 
 This runs the full pipeline:
   1. Generate synthetic resistivity models (SyntheticGenerator)
@@ -12,6 +17,8 @@ This runs the full pipeline:
 Usage:
     julia --project=. scripts/build_train_pairs.jl --n 50
     julia --project=. scripts/build_train_pairs.jl --n 200 --out data/synthetic/train_pairs.h5
+    julia --project=. scripts/build_train_pairs.jl --n 200 --tetm \
+        --out data/synthetic/train_pairs_v8_tetm_n200.h5
 
 Colab (cwd is /content — never `--project=.` from there):
     julia --project=/content/PriorModel /content/PriorModel/scripts/build_train_pairs.jl --n 50
@@ -29,6 +36,10 @@ using .SyntheticGenerator
 
 include(joinpath(ROOT, "src", "synthetic", "MeshParams.jl"))
 using .MTMeshParams: MeshParams, UNET_MESH, n_periods, frequencies_hz
+using .MTMeshParams: n_components, MT_DATA_LAYOUT, MT_DATA_LAYOUT_TETM
+
+include(joinpath(ROOT, "src", "synthetic", "MTInputStandardizer.jl"))
+using .MTInputStandardizer: pack_te_response, pack_tetm_response
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -40,6 +51,7 @@ function parse_args(argv::Vector{String})
         :out => joinpath(ROOT, "data", "synthetic", "train_pairs.h5"),
         :seed => 42,
         :priors => "",
+        :tetm => false,
     )
     i = 1
     while i <= length(argv)
@@ -53,6 +65,8 @@ function parse_args(argv::Vector{String})
             opts[:seed] = parse(Int, need())
         elseif a == "--priors"
             opts[:priors] = abspath(need())
+        elseif a == "--tetm"
+            opts[:tetm] = true
         end
         i += 1
     end
@@ -68,10 +82,13 @@ function main(argv::Vector{String}=ARGS)
     n_models = opts[:n]
     out_path = opts[:out]
     seed = opts[:seed]
+    tetm = Bool(opts[:tetm])
     rng = MersenneTwister(seed)
+    n_comp = n_components(UNET_MESH; tetm=tetm)
+    layout = tetm ? "TE+TM (4 ch)" : "TE-only (2 ch)"
 
     println("═" ^ 60)
-    println(" Building train_pairs.h5 — $n_models model(s)")
+    println(" Building train_pairs.h5 — $n_models model(s)  $layout")
     println("═" ^ 60)
 
     # Build mesh & priors
@@ -93,9 +110,8 @@ function main(argv::Vector{String}=ARGS)
     nzt, nyc = target_size(gmesh)
     n_st = length(gmesh.receiver_positions)
     n_freq = length(gmesh.frequencies)
-    n_comp = 2  # log10_rho_app, phase_deg
 
-    @info "Grid" nz=nzt nx=nyc n_stations=n_st n_periods=n_freq
+    @info "Grid" nz=nzt nx=nyc n_stations=n_st n_periods=n_freq n_components=n_comp tetm=tetm
 
     # Allocate output arrays
     X_all = Array{Float32,4}(undef, n_st, n_freq, n_comp, n_models)
@@ -108,17 +124,16 @@ function main(argv::Vector{String}=ARGS)
 
         resp = forward_response(model, gmesh; mode=:TETM)
 
-        # resp is MT2DResponse: rho_xy (n_freq, n_st), phase_xy (n_freq, n_st)
-        # We need (n_stations, n_periods, 2) — transpose freq/station axes
-        log10_rho_app = Float32.(log10.(resp.rho_xy'))   # (n_st, n_freq)
-        phase_deg     = Float32.(resp.phase_xy')          # (n_st, n_freq)
-
-        # Replace non-finite values
-        log10_rho_app[.!isfinite.(log10_rho_app)] .= 0.0f0
-        phase_deg[.!isfinite.(phase_deg)] .= 0.0f0
-
-        X_all[:, :, 1, i] = log10_rho_app
-        X_all[:, :, 2, i] = phase_deg
+        packed = if tetm
+            # TM phase folded to [0,90] inside pack_tetm_response (solver stores raw atan2).
+            pack_tetm_response(resp.rho_xy, resp.phase_xy, resp.rho_yx, resp.phase_yx)
+        else
+            pack_te_response(resp.rho_xy, resp.phase_xy)
+        end
+        packed[.!isfinite.(packed)] .= 0.0f0
+        size(packed) == (n_st, n_freq, n_comp) ||
+            error("packed MT tensor $(size(packed)) != ($n_st, $n_freq, $n_comp)")
+        X_all[:, :, :, i] = packed
 
         if i % max(1, n_models ÷ 10) == 0 || i == n_models
             elapsed = time() - t0
@@ -144,7 +159,11 @@ function main(argv::Vector{String}=ARGS)
         a["periods"] = Float64.(1.0 ./ gmesh.frequencies)
         a["n_models"] = n_models
         a["seed"] = seed
-        a["schema"] = "train_pairs/v1"
+        a["n_components"] = n_comp
+        a["tetm"] = tetm ? 1 : 0
+        comps = tetm ? MT_DATA_LAYOUT_TETM.components : MT_DATA_LAYOUT.components
+        a["components"] = join(comps, ",")
+        a["schema"] = tetm ? "train_pairs/v2-tetm" : "train_pairs/v1"
     end
 
     @info "train_pairs.h5 written" path=out_path n_models size_X=size(X_all) size_Y=size(Y_all)

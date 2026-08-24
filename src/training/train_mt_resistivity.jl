@@ -816,15 +816,19 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
     probe_dir = joinpath(ROOT, "results", "commemi_probe")
     if cfg.commemi_every > 0
         if isfile(cfg.commemi_obs)
-            try
-                commemi_mt = load_commemi_mt(cfg.commemi_obs, mesh, standardize_mt_input)
-                mkpath(probe_dir)
-                @printf("  COMMEMI probe: every %d ep, %d VFSA iter  obs=%s  tensor=%s\n",
-                        cfg.commemi_every, cfg.commemi_iter, cfg.commemi_obs, size(commemi_mt))
-            catch err
-                @warn "COMMEMI MT tensor failed to load; probe disabled" exception=err
-                commemi_mt = nothing
-            end
+            # Do not swallow pack/shape errors: a C=2 tensor here used to load
+            # "successfully", then DimensionMismatch was caught at the first
+            # probe epoch and --commemi-every became a silent no-op.
+            commemi_mt = load_commemi_mt(cfg.commemi_obs, mesh, standardize_mt_input)
+            C_probe = size(commemi_mt, 3)
+            C_probe == n_comp ||
+                error("COMMEMI probe tensor $(size(commemi_mt)) has C=$C_probe " *
+                      "but training C_in=$n_comp; refusing to disable " *
+                      "--commemi-every silently")
+            mkpath(probe_dir)
+            @printf("  COMMEMI probe: every %d ep, %d VFSA iter  obs=%s  tensor=%s  C_in=%d\n",
+                    cfg.commemi_every, cfg.commemi_iter, cfg.commemi_obs,
+                    size(commemi_mt), n_comp)
         else
             @warn "COMMEMI obs missing; probe disabled" path=cfg.commemi_obs
         end

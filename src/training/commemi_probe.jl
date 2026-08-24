@@ -14,6 +14,11 @@ using Printf
 using Dates
 using Statistics
 
+if !isdefined(@__MODULE__, :MTInputStandardizer)
+    include(joinpath(@__DIR__, "..", "synthetic", "MTInputStandardizer.jl"))
+end
+using .MTInputStandardizer: pack_tetm_response
+
 export load_commemi_mt, write_probe_ini, run_short_vfsa, probe_commemi_rms
 export should_save_checkpoint, should_probe_epoch, checkpoint_reason
 
@@ -127,16 +132,58 @@ end
 # COMMEMI MT tensor
 # ─────────────────────────────────────────────────────────────────────────────
 
-"""Duck-typed load: `standardize_fn(data; mp)` returns `(nS, nP, C)` Float32."""
+"""
+    load_commemi_mt(obs_path, mp, standardize_fn) -> Array{Float32,3}
+
+Load COMMEMI 2-D-I and resample onto `mp` as **TE+TM** `(n_stations, n_periods, 4)`.
+
+Packing always goes through [`pack_tetm_response`](@ref) so a 4-channel U-Net
+matches training `X` (including TM phase folded to `[0, 90]`). The duck-typed
+`standardize_mt_input(data)` path is TE-only (`C=2`) and is **not** used here —
+that was the silent `--commemi-every` no-op: load succeeded at `(30,20,2)`, then
+`DimensionMismatch` was caught at the first probe epoch.
+
+`standardize_fn` is the 3-argument interpolator
+`(stations, periods, raw; mp, method)`. Missing TM fields or `C ≠ 4` is a hard
+error, not a 2-channel fallback.
+"""
 function load_commemi_mt(obs_path::AbstractString, mp, standardize_fn)
     isfile(obs_path) || error("COMMEMI obs not found: $obs_path")
     _ensure_mtgeophysics()
     return Base.invokelatest(_load_commemi_mt_impl, obs_path, mp, standardize_fn)
 end
 
+function _obs_station_x(data)::Vector{Float64}
+    for name in (:receivers, :y, :x)
+        hasproperty(data, name) || continue
+        v = getproperty(data, name)
+        v isa AbstractVector && return Float64.(collect(v))
+    end
+    error("COMMEMI data $(typeof(data)) has no station x (receivers/y/x)")
+end
+
 function _load_commemi_mt_impl(obs_path, mp, standardize_fn)
     data = MTGeophysics.load_data2d(obs_path)
-    return standardize_fn(data; mp=mp, method=:bilinear)
+    (hasproperty(data, :rho_yx) && hasproperty(data, :phase_yx)) ||
+        error("COMMEMI obs $obs_path has no TM fields rho_yx/phase_yx; " *
+              "refusing 2-channel fallback (--commemi-every would silently no-op)")
+
+    # Same packer as build_train_pairs --tetm: TM phase folded to [0,90].
+    raw = pack_tetm_response(data.rho_xy, data.phase_xy, data.rho_yx, data.phase_yx)
+    size(raw, 3) == 4 ||
+        error("pack_tetm_response returned C=$(size(raw, 3)), expected 4")
+
+    out = standardize_fn(_obs_station_x(data),
+                         Float64.(collect(data.periods)),
+                         raw; mp=mp, method=:bilinear)
+
+    nS = Int(mp.n_stations)
+    nP = length(mp.periods)
+    size(out) == (nS, nP, 4) ||
+        error("COMMEMI probe tensor $(size(out)) ≠ ($nS, $nP, 4); " *
+              "--commemi-every would silently mismatch C_in")
+    @info "COMMEMI pack" packer = "pack_tetm_response" raw_size = size(raw) tensor = size(out)
+    return out
 end
 
 # ─────────────────────────────────────────────────────────────────────────────

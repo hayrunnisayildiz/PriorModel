@@ -112,4 +112,33 @@ end
         @test size(out) == (30, 20, 4)
         @test all(isfinite, out)
     end
+
+    @testset "pack_tetm_response folds TM phase to [0, 90]" begin
+        @test fold_tm_phase_to_0_90(-135.0) ≈ 45.0
+        @test fold_tm_phase_to_0_90(45.0) ≈ 45.0
+        @test isnan(fold_tm_phase_to_0_90(NaN))
+
+        rho_xy   = Float64[10.0 100.0; 20.0 200.0]
+        phase_xy = Float64[45.0  50.0; 40.0  55.0]
+        rho_yx   = Float64[30.0 300.0; 40.0 400.0]
+        phase_yx = Float64[-140.0 -130.0; -150.0 -120.0]
+        te = pack_te_response(rho_xy, phase_xy)
+        tetm = pack_tetm_response(rho_xy, phase_xy, rho_yx, phase_yx)
+        @test size(tetm) == (2, 2, 4)
+        @test tetm[:, :, 1:2] == te
+        @test te[2, 1, 2] == Float32(50.0)
+        @test all(0 .<= tetm[:, :, 4] .<= 90)
+        @test tetm[1, 1, 4] ≈ Float32(fold_tm_phase_to_0_90(-140.0))
+
+        data = MTGeophysics.load_data2d(COMMEMI_OBS)
+        @test maximum(data.phase_yx) < 0
+        packed = pack_tetm_response(data.rho_xy, data.phase_xy, data.rho_yx, data.phase_yx)
+        @test size(packed, 3) == 4
+        @test all(0 .<= packed[:, :, 2] .<= 90)
+        @test all(0 .<= packed[:, :, 4] .<= 90)
+        rms_raw = sqrt(mean(abs2, data.phase_yx .- data.phase_xy))
+        rms_fold = sqrt(mean(abs2, packed[:, :, 4] .- packed[:, :, 2]))
+        @test rms_raw > 90
+        @test rms_fold < 45
+    end
 end

@@ -79,6 +79,8 @@ const MT_DATA_LAYOUT = (
 """
 Joint TE/TM layout: `(n_stations, n_periods, 4)` with
 `[log10_ρ_TE, phase_TE, log10_ρ_TM, phase_TM]`.
+TM phase is folded to `[0, 90]` by `pack_tetm_response` (raw `arg(Zyx)` is
+`~arg(Zxy)−180°`).
 """
 const MT_DATA_LAYOUT_TETM = (
     axis_station = 1,
