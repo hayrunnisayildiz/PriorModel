@@ -8,8 +8,9 @@ L_total = λ_data · L1(predicted, true_resistivity)
         + λ_tv  · TotalVariation(predicted)
 ```
 
-All computations are in log10(ρ) space.  Unlike [`PriorTrainingLoss`](@ref),
-there is no partial well supervision — we have complete synthetic ground truth.
+All computations are in log10(ρ) space. Unlike the archived 3-D well-supervised
+loss (`archive/3d_keivitsa/src/training/PriorTrainingLoss.jl`), there is no
+partial borehole supervision — we have complete synthetic ground truth.
 """
 module MTPriorLoss
 

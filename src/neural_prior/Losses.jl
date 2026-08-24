@@ -1,7 +1,11 @@
 """
     Losses
 
-Prior-fitting losses for [`PriorNet3D.SmartPriorNet3D`](@ref).
+3-D borehole-masked data term and anisotropic TV regulariser on ``\\log_{10} m_0``.
+
+These helpers remain in `src/` for reuse (e.g. 3-D TV). The networks that once
+consumed them (`SmartPriorNet3D`, `UnifiedPriorUNet3D` training) live under
+`archive/3d_keivitsa/` and are not on the active 2-D MT path.
 
 The data term is evaluated only at known borehole resistivity voxels (a boolean
 or 0/1 mask). Spatial continuity is an anisotropic 3-D total variation (TV)

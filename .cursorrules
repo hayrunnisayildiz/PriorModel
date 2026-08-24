@@ -3,6 +3,11 @@ Sen jeofizik ters çözüm (inversion), manyetotellürik (MT) modelleme ve Julia
 Proje Amacı:
 MT verilerini (istasyon x periyot; görünür özdirenç ve faz) alıp 2D özdirenç grid'i (prior model) üreten, MTGeophysics.jl (2D TE/TM solver, VFSA2DMT) ile tam entegre, Lux.jl tabanlı bir 2D U-Net pipeline'ı geliştirmek.
 
+Giriş noktası:
+- `main.jl` 2D MT E2E sarmalayıcısıdır: `examples/run_mt_prior_inversion.jl`'i include edip `main()` çağırır (kopya değil).
+- 3D Keivitsa hattı (`UnifiedPriorUNet3D`, Voxelizer, gravite/manyetik) dondurulmuştur: `archive/3d_keivitsa/README_3D_ARCHIVE.md`.
+- Eğitim: `src/training/train_mt_resistivity.jl` + `commemi_probe.jl`. `src/analysis/keivitsa_stats.jl` 2D sentetik kalibrasyon için aktiftir.
+
 Teknik Stack & Standartlar:
 - Diller: Julia (veri üretimi, forward modelleme, eğitim, MTGeophysics.jl entegrasyonu) ve Python/PyTorch (veya saf Lux.jl / Julia).
 - Paketler: MTGeophysics.jl, Lux.jl, ComponentArrays.jl, Optimisers.jl, Zygote.jl, JLD2, DataFrames, CSV.
