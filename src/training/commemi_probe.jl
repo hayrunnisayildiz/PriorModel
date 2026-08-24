@@ -15,14 +15,32 @@ using Dates
 using Statistics
 
 export load_commemi_mt, write_probe_ini, run_short_vfsa, probe_commemi_rms
-export should_save_checkpoint, should_probe_epoch
+export should_save_checkpoint, should_probe_epoch, checkpoint_reason
 
-# MTGeophysics.jl declares GLMakie as a hard dependency and does `using GLMakie`
-# at package load (try/catch LoadError only). That import can hang or crash a
-# headless Colab runtime. Load it only when a probe actually runs; training
-# with `--commemi-every 0` never touches GLMakie.
+# MTGeophysics.jl lists GLMakie as a hard *package* dependency, but the only
+# `using GLMakie` is inside a try/catch wrapping PlotModel.jl (interactive 3-D
+# viewers). 2-D VFSA (`run_mt2d_vfsa`) uses CairoMakie, which is headless-safe.
+# If the real GLMakie is allowed to load, GLFW waits for an OpenGL context and
+# hangs Colab. Pre-register an empty GLMakie module so `using GLMakie` is a
+# no-op; PlotModel.jl then fails and is caught, while VFSA still loads.
+# Set PRIORMODEL_ALLOW_GLMAKIE=1 to load the real package (local GUI).
+const _GLMAKIE_UUID = Base.UUID("e9467ef8-e4e7-5192-8a1a-b1aee30e663a")
+
+function _block_glmakie!()
+    get(ENV, "PRIORMODEL_ALLOW_GLMAKIE", "0") == "1" && return
+    pkgid = Base.PkgId(_GLMAKIE_UUID, "GLMakie")
+    haskey(Base.loaded_modules, pkgid) && return
+    dummy = Module(:GLMakie)
+    Base.loaded_modules[pkgid] = dummy
+    if isdefined(Base, :loaded_modules_order)
+        push!(Base.loaded_modules_order, dummy)
+    end
+    return
+end
+
 function _ensure_mtgeophysics()
     isdefined(@__MODULE__, :MTGeophysics) && return
+    _block_glmakie!()
     @eval using MTGeophysics
     return
 end
@@ -77,6 +95,34 @@ function should_save_checkpoint(val_loss::Real, commemi_rms::Real,
     end
 end
 
+"""Human-readable reason matching [`should_save_checkpoint`](@ref) (for logs)."""
+function checkpoint_reason(val_loss::Real, commemi_rms::Real,
+                           best_val::Real, best_rms::Real)::String
+    measured = isfinite(Float64(commemi_rms))
+    have_rms = isfinite(Float64(best_rms))
+    v = Float64(val_loss)
+    r = Float64(commemi_rms)
+    bv = Float64(best_val)
+    br = Float64(best_rms)
+    save = should_save_checkpoint(val_loss, commemi_rms, best_val, best_rms)
+    verb = save ? "SAVE" : "SKIP"
+    if measured
+        if !have_rms
+            return "$verb (first measured commemi_rms=$(round(r; digits=4)))"
+        elseif r < br - 1.0e-8
+            return "$verb (commemi_rms $(round(r; digits=4)) < best $(round(br; digits=4)))"
+        elseif r > br + 1.0e-8
+            return "$verb (commemi_rms $(round(r; digits=4)) > best $(round(br; digits=4)); val_loss=$(round(v; digits=4)) ignored)"
+        else
+            return "$verb (tied commemi_rms=$(round(r; digits=4)); val_loss $(round(v; digits=4)) vs best $(round(bv; digits=4)))"
+        end
+    elseif have_rms
+        return "$verb (no probe this epoch; keep commemi_rms=$(round(br; digits=4)); val_loss ignored)"
+    else
+        return "$verb (val_loss fallback $(round(v; digits=4)) vs best $(round(bv; digits=4)))"
+    end
+end
+
 # ─────────────────────────────────────────────────────────────────────────────
 # COMMEMI MT tensor
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,6 +131,10 @@ end
 function load_commemi_mt(obs_path::AbstractString, mp, standardize_fn)
     isfile(obs_path) || error("COMMEMI obs not found: $obs_path")
     _ensure_mtgeophysics()
+    return Base.invokelatest(_load_commemi_mt_impl, obs_path, mp, standardize_fn)
+end
+
+function _load_commemi_mt_impl(obs_path, mp, standardize_fn)
     data = MTGeophysics.load_data2d(obs_path)
     return standardize_fn(data; mp=mp, method=:bilinear)
 end
@@ -179,7 +229,7 @@ end
 1 chain, 200 ctrl (same as the full COMMEMI eval), `max_iter` ≪ 100.
 Uses `run_mt2d_vfsa` (the plot-free API; `VFSA2DMT()` is the wrapper that
 writes CairoMakie figures). `keep_models=false`, `snapshot_interval=0`.
-Loading MTGeophysics still pulls GLMakie at package init — see `_ensure_mtgeophysics`.
+GLMakie is stubbed before `using MTGeophysics` — see `_block_glmakie!`.
 """
 function run_short_vfsa(start_ini::AbstractString, obs_path::AbstractString;
                         max_iter::Int=25,
@@ -189,6 +239,11 @@ function run_short_vfsa(start_ini::AbstractString, obs_path::AbstractString;
     isfile(start_ini) || error("start model not found: $start_ini")
     isfile(obs_path)  || error("obs not found: $obs_path")
     _ensure_mtgeophysics()
+    return Base.invokelatest(_run_short_vfsa_impl, start_ini, obs_path,
+                             max_iter, n_ctrl, seed, work_dir)
+end
+
+function _run_short_vfsa_impl(start_ini, obs_path, max_iter, n_ctrl, seed, work_dir)
     stamp = Dates.format(Dates.now(), "yyyymmdd_HHMMSS")
     run_dir = joinpath(abspath(work_dir), "probe_VFSA2DMT_$stamp")
     mkpath(run_dir)

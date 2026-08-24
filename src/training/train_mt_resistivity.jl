@@ -20,8 +20,8 @@ Colab (cwd is /content — never `--project=.` from there):
 Checkpoint selection: COMMEMI short-VFSA `commemi_rms` is primary (probed every
 `--commemi-every` epochs; default 10, `0` disables the probe). Synthetic
 `val_loss` is the fallback / tie-breaker. `--no-plot` skips the training-curve
-PNG (headless-safe). On Colab the probe must stay off: MTGeophysics.jl loads
-GLMakie at package init and that import is not patchable from this repo.
+PNG (Plots.jl subprocess; not GLMakie). The probe loads MTGeophysics lazily
+and stubs GLMakie so OpenGL is never required (CairoMakie is the VFSA backend).
 =#
 
 include(joinpath(@__DIR__, "..", "pkg_setup.jl"))
@@ -56,7 +56,7 @@ using .MTResistivityUNet2DLayers.MTMeshParams: MeshParams, DEFAULT_MESH, n_perio
 using .MTPriorLoss: mt_prior_loss_terms
 using .MTInputStandardizer: standardize_mt_input
 using .CommemiProbe: load_commemi_mt, probe_commemi_rms,
-                     should_save_checkpoint, should_probe_epoch
+                     should_save_checkpoint, should_probe_epoch, checkpoint_reason
 
 """Colab `%%bash` block-buffers stdout; flush so epoch lines appear immediately."""
 function _say(args...)
@@ -915,6 +915,8 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
         push!(log_val, avg_val)
         push!(log_rms, epoch_rms)
 
+        reason = checkpoint_reason(avg_val, epoch_rms, best_val_loss, best_commemi_rms)
+        println("  checkpoint: ", reason)
         if should_save_checkpoint(avg_val, epoch_rms, best_val_loss, best_commemi_rms)
             best_val_loss = avg_val
             best_epoch = epoch

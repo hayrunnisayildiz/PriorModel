@@ -249,12 +249,22 @@ function standardize_mt_input(raw_stations::AbstractVector,
     return out
 end
 
-"""Duck-typed `MTGeophysics.load_data2d` result: `.receivers`, `.periods`, `.rho_xy`, `.phase_xy`."""
+"""Station x-coordinates from an MTGeophysics `DataFile2D` (or a duck-typed equivalent)."""
+function _station_x(data)::Vector{Float64}
+    for name in (:receivers, :y, :x)
+        hasproperty(data, name) || continue
+        v = getproperty(data, name)
+        v isa AbstractVector && return Float64.(collect(v))
+    end
+    error("MT data $(typeof(data)) has no station x vector (receivers/y/x)")
+end
+
+"""Duck-typed `MTGeophysics.load_data2d` result: station x, `.periods`, `.rho_xy`, `.phase_xy`."""
 function standardize_mt_input(data;
                               mp=CANONICAL_MESH,
                               method::Symbol=:bilinear)::Array{Float32,3}
     raw = pack_te_response(data.rho_xy, data.phase_xy)
-    return standardize_mt_input(Float64.(collect(data.receivers)),
+    return standardize_mt_input(_station_x(data),
                                 Float64.(collect(data.periods)),
                                 raw; mp=mp, method=method)
 end
