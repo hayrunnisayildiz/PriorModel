@@ -70,45 +70,48 @@ and keep artifacts under the same layout as the repo (`data/synthetic/*.h5`,
 `/content/drive/MyDrive/PriorModel/` and the nested path
 `MyDrive/PriorModelData/PriorModel/PriorModel/`.
 
-**Never use `--project=.` on Colab.** The notebook cwd is `/content`. That flag
-creates a leftover empty `/content/Project.toml` which then hides this repo's
-environment, so `using HDF5` / `using LuxCUDA` fail. Always pass the clone path:
+**`cd /content/PriorModel` first, then `--project=.`.** Running `--project=.`
+from `/content` creates an empty `/content/Project.toml` which hides this
+repo. Delete leftover `/content/Project.toml` if it exists.
 
 ```bash
-julia --project=/content/PriorModel -e 'include("/content/PriorModel/src/pkg_setup.jl")'
+cd /content/PriorModel
+julia --project=. -e 'include("src/pkg_setup.jl")'
 ```
-
-If `/content/Project.toml` already exists, delete it.
 
 ### 3. Data and checkpoints
 
-`data/synthetic/*.h5` and `models/*.jld2` are gitignored (they are large). Copy
-them from Drive with the notebook Python cell (not Julia). Prefer
-`train_pairs_v8_tetm_n200.h5` (48×240, 4-channel TE+TM). Do not train on
-`train_pairs_v7.h5` (48×120). The 5 MB `train_pairs.h5` is only a smoke test.
-
-If the HDF5 is missing, the notebook builds it with `xvfb-run` and
-`--tetm --n 200`. A raw `julia … build_train_pairs.jl` on Colab loads
-MTGeophysics → GLMakie and hangs.
-
-### 4. Train (headless)
-
-`MTGeophysics.jl` v0.4.2 lists **GLMakie as a hard dependency** and runs
-`using GLMakie` at package load. That cannot be patched from this repo; on a
-headless Colab VM the import hangs or crashes. Disable the COMMEMI VFSA probe
-and skip the training-curve PNG:
+`data/synthetic/*.h5` and `models/*.jld2` are gitignored. Do **not** reuse
+`train_pairs_v8_tetm_n200.h5` (that file is the discarded dx=80 run). Build:
 
 ```bash
-julia --project=/content/PriorModel \
-  /content/PriorModel/src/training/train_mt_resistivity.jl \
-  --dataset /content/PriorModel/data/synthetic/train_pairs_v8_tetm_n200.h5 \
-  --epochs 50 --output /content/PriorModel/models/prior_v8_tetm_n200.jld2 \
-  --commemi-every 0 --no-plot
+cd /content/PriorModel
+xvfb-run -a julia --project=. scripts/build_train_pairs.jl --n 200 --seed 42 --tetm \
+  --out data/synthetic/train_pairs_v8_tetm_n200_dx160.h5
 ```
 
-`--commemi-every` defaults to 10 locally (probe every 10 epochs). Keep
-`--commemi-every 0` on Colab. First epoch compiles CUDA/Zygote; 10–20 min
-with no output is normal.
+The production log must show `UNET_MESH: nx=120  dx=160.0 m` (v4–v7 contract).
+A raw `julia … build_train_pairs.jl` on Colab loads MTGeophysics → GLMakie
+and hangs unless wrapped in `xvfb-run`.
 
-Scripts share one bootstrap (`src/pkg_setup.jl`) that activates `ROOT` no matter
-which directory you start Julia from, as long as `--project` points at the clone.
+### 4. Train (COMMEMI probe on)
+
+`train_mt_resistivity.jl` stubs GLMakie so `--commemi-every 5` is safe on
+headless Colab. Do **not** pass `--commemi-every 0` (that was the discarded
+run: val_loss fallback, Phase 1 probe disabled).
+
+```bash
+cd /content/PriorModel
+julia --project=. src/training/train_mt_resistivity.jl \
+  --dataset data/synthetic/train_pairs_v8_tetm_n200_dx160.h5 \
+  --epochs 15 --commemi-every 5 \
+  --output models/prior_v8_tetm_n200_dx160.jld2 \
+  --training-log results/training_log_v8_tetm_n200_dx160.csv \
+  --split-json results/train_val_split_v8_tetm_n200_dx160.json \
+  --curve-png results/training_curve_v8_tetm_n200_dx160.png
+```
+
+First epoch compiles CUDA/Zygote; 10–20 min with no output is normal.
+
+Scripts share one bootstrap (`src/pkg_setup.jl`) that activates `ROOT` after
+`cd /content/PriorModel`.

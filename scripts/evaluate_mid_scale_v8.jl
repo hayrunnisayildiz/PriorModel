@@ -1,24 +1,16 @@
 #!/usr/bin/env julia
 #=
-Evaluate models/res_test_v8.jld2 on the COMMEMI 2-D benchmark.
+Evaluate models/prior_v8_tetm_n200_dx160.jld2 on the COMMEMI 2-D benchmark.
 
-v8 = cheap horizontal-resolution probe: same 19.2 km span, dx=160→80 m
-(nx=120→240), nz/dz unchanged, n=250 pairs, 25 epochs. Tests whether
-coarse dx was the v4–v7 grid-RMSE bottleneck before scaling to n=1000.
+v8 TE+TM = same UNET_MESH as v4–v7 (dx=160 m, nx=120), n=200 pairs,
+15 epochs, --commemi-every 5, 4-channel input
+[log10 ρ_TE, phase_TE, log10 ρ_TM, phase_TM]. COMMEMI is packed with
+`pack_tetm_response` so C_in matches training.
 
 Usage (from project root):
     julia --project=. scripts/evaluate_mid_scale_v8.jl
-
-Colab (cwd is /content — never `--project=.` from there):
-    julia --project=/content/PriorModel /content/PriorModel/scripts/evaluate_mid_scale_v8.jl
-
-Steps:
-  1. Standardize COMMEMI .obs onto the U-Net survey, write HDF5, call generate_prior
-  2. Run VFSA2DMT with identical settings to all previous tests
-     (1 chain, 200 ctrl, 100 iter, seed=20260308)
-  3. Print eleven-way RMS table + T_ood / x_ood + go/stop on grid RMSE
-  4. Heatmap: predicted prior vs resampled COMMEMI true model
-     → results/evaluate_v8/predicted_vs_true.png
+    julia --project=. scripts/evaluate_mid_scale_v8.jl \
+        models/prior_v8_tetm_n200_dx160.jld2 results/evaluate_v8_tetm_dx160
 =#
 
 include(joinpath(@__DIR__, "..", "src", "pkg_setup.jl"))
@@ -28,7 +20,7 @@ using Printf, Dates, Statistics, HDF5, Plots, MTGeophysics
 include(joinpath(ROOT, "src", "inference", "export_prior_to_mtgeophysics.jl"))
 using .ExportPriorToMTGeophysics:
     generate_prior, write_ini_prior, load_trained_model, predict_prior,
-    load_mt_observations, standardize_mt_input
+    load_mt_observations, standardize_mt_input, pack_te_response, pack_tetm_response
 using .ExportPriorToMTGeophysics.MTResistivityUNet2DLayers.MTMeshParams:
     MeshParams, station_positions
 using .ExportPriorToMTGeophysics.MTResistivityUNet2DLayers:
@@ -59,19 +51,22 @@ const V7_GRID_RMSE = 1.0633          # pred-vs-true log10 Ω·m on the v7 (dx=16
 const RMSE_CONTINUE = 0.7            # v8 grid RMSE below this → keep refining dx
 const V4_IMPROVE_REL = 0.15          # relative drop vs previous U-Net to count as "belirgin"
 
-"""
-    commemi_obs_to_mt_tensor(obs_path, mp) -> (Array{Float32,3}, Bool)
-
-Load COMMEMI `.obs` via `MTGeophysics.load_data2d` and resample onto the
-U-Net survey with [`standardize_mt_input`](@ref). Second return is `T_ood`:
-true iff COMMEMI periods fall outside `mp.periods`.
-"""
-function commemi_obs_to_mt_tensor(obs_path::String, mp::MeshParams)
+# COMMEMI .obs → U-Net tensor. n_channels=4 uses pack_tetm_response (training --tetm).
+function commemi_obs_to_mt_tensor(obs_path::String, mp::MeshParams; n_channels::Int=4)
     isfile(obs_path) || error("COMMEMI obs not found: $obs_path")
     data = MTGeophysics.load_data2d(obs_path)
     src_y = Float64.(data.receivers)
     src_T = Float64.(data.periods)
-    out = standardize_mt_input(data; mp=mp, method=:bilinear)
+    raw = if n_channels == 4
+        pack_tetm_response(data.rho_xy, data.phase_xy, data.rho_yx, data.phase_yx)
+    elseif n_channels == 2
+        pack_te_response(data.rho_xy, data.phase_xy)
+    else
+        error("n_channels=$n_channels; expected 2 or 4")
+    end
+    out = standardize_mt_input(src_y, src_T, raw; mp=mp, method=:bilinear)
+    size(out, 3) == n_channels ||
+        error("COMMEMI tensor $(size(out)) ≠ C=$n_channels")
     nS, nP = size(out, 1), size(out, 2)
     @printf("  COMMEMI survey: %d stations  y∈[%.0f, %.0f] m,  %d periods T∈[%.4g, %.4g] s\n",
             length(src_y), minimum(src_y), maximum(src_y),
@@ -92,7 +87,8 @@ function write_mt_h5(path::String, mt_data::Array{Float32,3})
         f["mt_data"] = mt_data
         a = HDF5.attributes(f)
         a["source"] = "COMMEMI Comemi2D1.obs (interpolated to U-Net survey)"
-        a["schema"] = "commemi_mt/v2"
+        a["schema"] = size(mt_data, 3) == 4 ? "commemi_mt/v2-tetm" : "commemi_mt/v2"
+        a["n_components"] = size(mt_data, 3)
     end
     return abspath(path)
 end
@@ -240,7 +236,7 @@ function interpret_v8(v8_best, grid_rmse)
     if grid_rmse < RMSE_CONTINUE
         msg = "DEVAM ET: v8 grid RMSE=$(round(grid_rmse; digits=4)) < $(RMSE_CONTINUE) " *
               "(v7=$(V7_GRID_RMSE), Δ=$(round(delta; digits=4))). " *
-              "Çözünürlük gerçekten darboğazdı — n=1000'e bu YENİ mesh ile (dx=80 m) çık."
+              "TE+TM n=200, dx=160 grid RMSE eşiğin altında — n=1000 ayrı bir karar."
     else
         msg = "DUR: v8 grid RMSE=$(round(grid_rmse; digits=4)) v7 ($(V7_GRID_RMSE)) ile " *
               "aynı mertebede (Δ=$(round(delta; digits=4)), eşik <$(RMSE_CONTINUE)). " *
@@ -274,12 +270,11 @@ function print_eleven_way_table(v8_init, v8_best)
     @printf("  %-58s  initial=%-12s  best=%-12s\n",
             "U-Net (1000/50ep, v7, senaryo+commemi_rms):", fmt(V7_INIT), fmt(V7_BEST))
     @printf("  %-58s  initial=%-12s  best=%-12s\n",
-            "U-Net (250/25ep, v8, YÜKSEK ÇÖZÜNÜRLÜK dx=80):", fmt(v8_init), fmt(v8_best))
+            "U-Net (200/15ep, v8 TE+TM, dx=160):", fmt(v8_init), fmt(v8_best))
     @printf("  %-58s  initial=%-12s  best=%-12s\n",
             "Gerçek model (sanity):", fmt(TRUE_INIT), fmt(TRUE_BEST))
     println("─" ^ 88)
-    println("  v4–v7 mesh: T∈[1e-3,1e3] s, dx=160 m, x∈[-9520,9040] m")
-    println("  v8 mesh:    T∈[1e-3,1e3] s, dx=80 m,  nx=240, x∈[-9560,9000] m")
+    println("  v4–v8 mesh: T∈[1e-3,1e3] s, dx=160 m, nx=120 (same UNET_MESH)")
     if v8_best !== nothing
         println()
         @printf("  v8 vs homojen (5.7354):  Δbest=%+.4f   %s\n",
@@ -309,7 +304,7 @@ function plot_predicted_vs_true(pred::Matrix{Float32}, truth::Matrix{Float32},
         colorbar_title="log₁₀(ρ) [Ω·m]",
         aspect_ratio=:equal)
     p_pred = Plots.heatmap(pred;
-        title="U-Net v8 prior (dx=80 m)",
+        title="U-Net v8 TE+TM prior (dx=160 m)",
         xlabel="Profile cell", ylabel="Depth cell",
         yflip=true, color=:turbo, clims=(lo, hi),
         colorbar_title="log₁₀(ρ) [Ω·m]",
@@ -328,10 +323,12 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 
 function main()
-    checkpoint   = joinpath(ROOT, "models", "res_test_v8.jld2")
+    checkpoint   = length(ARGS) >= 1 ? abspath(ARGS[1]) :
+                   joinpath(ROOT, "models", "prior_v8_tetm_n200_dx160.jld2")
+    results_dir  = length(ARGS) >= 2 ? abspath(ARGS[2]) :
+                   joinpath(ROOT, "results", "evaluate_v8_tetm_dx160")
     vfsa_data    = joinpath(ROOT, "examples", "0COMEMI2D-I", "Comemi2D1.obs")
     true_model   = joinpath(ROOT, "examples", "0COMEMI2D-I", "Comemi2D1.true")
-    results_dir  = joinpath(ROOT, "results", "evaluate_v8")
     mkpath(results_dir)
 
     isfile(checkpoint) || error("v8 checkpoint not found: $checkpoint")
@@ -339,20 +336,24 @@ function main()
     isfile(true_model) || error("COMMEMI true model not found: $true_model")
 
     println("═" ^ 88)
-    println(" Resolution probe v8: U-Net (250/25ep, dx=80 m, nx=240, nz/dz unchanged)")
+    println(" v8 TE+TM: U-Net (200/15ep, dx=160 m, nx=120, commemi-every 5, 4-channel)")
     println("═" ^ 88)
+    println("  checkpoint: ", checkpoint)
+    println("  results:    ", results_dir)
 
     # ── Step 1: COMMEMI MT → prior .ini ──────────────────────────────────────
-    println("\n[1/4] Generating COMMEMI prior from res_test_v8.jld2...")
+    println("\n[1/4] Generating COMMEMI prior from ", basename(checkpoint), "...")
     model, ps, st, mp = load_trained_model(checkpoint)
     n_params = count_parameters(ps)
     cap = report_capacity_change(mp)
+    n_ch = Int(model.in_channels)
     println("  model: ", model)
-    @printf("  mesh: nz=%d nx=%d dx=%.1f m dz=%.1f m\n", mp.nz, mp.nx, mp.dx, mp.dz)
+    @printf("  mesh: nz=%d nx=%d dx=%.1f m dz=%.1f m  C_in=%d\n",
+            mp.nz, mp.nx, mp.dx, mp.dz, n_ch)
     @printf("  params this ckpt: %d    v4 layout: %d    v5 layout: %d  (×%.2f)\n",
             n_params, cap.n_old, cap.n_new, cap.ratio)
 
-    mt_data, T_ood = commemi_obs_to_mt_tensor(vfsa_data, mp)
+    mt_data, T_ood = commemi_obs_to_mt_tensor(vfsa_data, mp; n_channels=n_ch)
     xs = station_positions(mp)
     data_obs = MTGeophysics.load_data2d(vfsa_data)
     src_x = Float64.(data_obs.receivers)
@@ -363,9 +364,9 @@ function main()
     mt_h5 = write_mt_h5(joinpath(results_dir, "commemi_mt.h5"), mt_data)
     println("  COMMEMI MT tensor ", size(mt_data), " → $mt_h5")
 
-    prior_ini = joinpath(results_dir, "res_test_v8.ini")
+    prior_ini = joinpath(results_dir, "prior_v8_tetm.ini")
     generate_prior(mt_h5, checkpoint, prior_ini;
-                   title="U-Net prior v8 (250 samples, 25 ep, dx=80 m resolution probe)")
+                   title="U-Net prior v8 TE+TM (200 samples, 15 ep, dx=160 m)")
     println("  → $prior_ini")
 
     pred_logres = predict_prior(model, ps, st, mt_data)
@@ -409,7 +410,7 @@ function main()
     table_path = joinpath(results_dir, "comparison.txt")
     open(table_path, "w") do io
         println(io, "Eleven-way COMMEMI RMS comparison (1 chain, 200 ctrl, 100 iter, seed=20260308)")
-        println(io, "v8 checkpoint: models/res_test_v8.jld2")
+        println(io, "v8 checkpoint: $checkpoint")
         println(io, "VFSA run_dir:  $run_dir")
         println(io, "T_ood (COMMEMI ⊂ eğitim T): $T_ood")
         println(io, "x_ood (COMMEMI ⊂ eğitim x): $x_ood/$(length(src_x))")
@@ -436,7 +437,7 @@ function main()
         @printf(io, "  %-58s  initial=%-12s  best=%-12s\n",
                 "U-Net (1000/50ep, v7, senaryo+commemi_rms):", fmt(V7_INIT), fmt(V7_BEST))
         @printf(io, "  %-58s  initial=%-12s  best=%-12s\n",
-                "U-Net (250/25ep, v8, YÜKSEK ÇÖZÜNÜRLÜK dx=80):", fmt(v8_init), fmt(v8_best))
+                "U-Net (200/15ep, v8 TE+TM, dx=160):", fmt(v8_init), fmt(v8_best))
         @printf(io, "  %-58s  initial=%-12s  best=%-12s\n",
                 "Gerçek model (sanity):", fmt(TRUE_INIT), fmt(TRUE_BEST))
         println(io, "")
@@ -455,13 +456,12 @@ function main()
                     v8_best < V5_BEST ? "v5'ten iyi" : "v5'ten kötü/eşit")
             println(io, "")
         end
-        println(io, "v4–v7 mesh: T∈[1e-3,1e3] s, dx=160 m")
-        println(io, "v8 mesh:    T∈[1e-3,1e3] s, dx=80 m, nx=240, nz=48 (dz unchanged)")
-        println(io, "v8 data: n=250, 25 epochs, same 11-scenario mix")
+        println(io, "v4–v8 mesh: T∈[1e-3,1e3] s, dx=160 m, nx=120 (same UNET_MESH)")
+        println(io, "v8 data: n=200, 15 epochs, --commemi-every 5, TE+TM 4-channel")
         println(io, "Yorum: ", interpretation)
         println(io, "")
         println(io, "See also: results/KNOWN_LIMITATIONS.md")
-        println(io, "Training curve: results/training_curve_v8.png")
+        println(io, "Training curve: results/training_curve_v8_tetm_n200_dx160.png")
     end
     println("  → $table_path")
 

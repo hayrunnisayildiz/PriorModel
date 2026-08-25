@@ -49,10 +49,10 @@ include(joinpath(ROOT, "src", "networks", "mt_resistivity_unet2d.jl"))
 
 using .MTResistivityUNet2DLayers: MTResistivityUNet2D, replace_nan, add_batch_dim
 using .MTResistivityUNet2DLayers.MTMeshParams: MeshParams, DEFAULT_MESH, n_periods, validate_mesh_params, frequencies_hz
-using .MTInputStandardizer: standardize_mt_input, pack_te_response
+using .MTInputStandardizer: standardize_mt_input, pack_te_response, pack_tetm_response
 
 export load_trained_model, predict_prior, write_ini_prior, generate_prior
-export load_mt_observations, standardize_mt_input, pack_te_response
+export load_mt_observations, standardize_mt_input, pack_te_response, pack_tetm_response
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model loading
@@ -327,7 +327,10 @@ function generate_prior(mt_obs_path::String,
                         kwargs...)
     model, ps, st, mp = load_trained_model(checkpoint_path)
     mt_data = _load_and_standardize(mt_obs_path, mp; method=method,
-                                    stations=stations, periods=periods)
+                                    stations=stations, periods=periods,
+                                    n_channels=Int(model.in_channels))
+    size(mt_data, 3) == model.in_channels ||
+        error("MT tensor C=$(size(mt_data, 3)) ≠ model C_in=$(model.in_channels)")
     logres = predict_prior(model, ps, st, mt_data)
     write_ini_prior(logres, output_ini_path, mp; kwargs...)
     return abspath(output_ini_path)
@@ -353,18 +356,38 @@ function _looks_like_obs(path::AbstractString)::Bool
     return ext in (".obs", ".dat", ".edi")
 end
 
-function _mt_tensor_from_obs(path::AbstractString, mp; method::Symbol=:bilinear)
+function _obs_station_x(data)::Vector{Float64}
+    for name in (:receivers, :y, :x)
+        hasproperty(data, name) || continue
+        v = getproperty(data, name)
+        v isa AbstractVector && return Float64.(collect(v))
+    end
+    error("MT data $(typeof(data)) has no station x vector (receivers/y/x)")
+end
+
+function _mt_tensor_from_obs(path::AbstractString, mp; method::Symbol=:bilinear,
+                             n_channels::Int=2)
     data = MTGeophysics.load_data2d(path)
-    return standardize_mt_input(data; mp=mp, method=method)
+    raw = if n_channels == 4
+        pack_tetm_response(data.rho_xy, data.phase_xy, data.rho_yx, data.phase_yx)
+    elseif n_channels == 2
+        pack_te_response(data.rho_xy, data.phase_xy)
+    else
+        error("n_channels=$n_channels; expected 2 (TE) or 4 (TE+TM)")
+    end
+    return standardize_mt_input(_obs_station_x(data),
+                                Float64.(collect(data.periods)),
+                                raw; mp=mp, method=method)
 end
 
 """Load HDF5 / `.obs` and resample onto `mp` when the survey is not canonical."""
 function _load_and_standardize(path::String, mp;
                                method::Symbol=:bilinear,
                                stations=nothing,
-                               periods=nothing)::Array{Float32,3}
+                               periods=nothing,
+                               n_channels::Int=2)::Array{Float32,3}
     if _looks_like_obs(path)
-        return _mt_tensor_from_obs(path, mp; method=method)
+        return _mt_tensor_from_obs(path, mp; method=method, n_channels=n_channels)
     end
 
     x = load_mt_observations(path; mp=mp)

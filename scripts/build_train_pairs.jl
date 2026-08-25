@@ -112,6 +112,13 @@ function main(argv::Vector{String}=ARGS)
     n_freq = length(gmesh.frequencies)
 
     @info "Grid" nz=nzt nx=nyc n_stations=n_st n_periods=n_freq n_components=n_comp tetm=tetm
+    @printf("  UNET_MESH: nx=%d  dx=%.1f m  nz=%d  dz=%.1f m  span=%.1f km  (v4–v7 contract: nx=120 dx=160 m)\n",
+            UNET_MESH.nx, UNET_MESH.dx, UNET_MESH.nz, UNET_MESH.dz,
+            UNET_MESH.nx * UNET_MESH.dx / 1000)
+    (UNET_MESH.nx == 120 && UNET_MESH.dx == 160.0) ||
+        error("UNET_MESH is not the v4–v7 contract: nx=$(UNET_MESH.nx) dx=$(UNET_MESH.dx) (expected nx=120 dx=160)")
+    (nyc == UNET_MESH.nx && Float64(cfg.y_core_cell) == UNET_MESH.dx) ||
+        error("generator mesh drifted from UNET_MESH: nx=$nyc dx=$(cfg.y_core_cell)")
 
     # Allocate output arrays
     X_all = Array{Float32,4}(undef, n_st, n_freq, n_comp, n_models)

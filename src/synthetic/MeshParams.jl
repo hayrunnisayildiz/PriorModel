@@ -31,8 +31,7 @@ source of truth for grid geometry and MT sampling.
 
 [`UNET_MESH`](@ref) is the canonical **network** survey (30 stations × 20
 log-spaced periods, `T ∈ [10⁻³, 10³]` s, profile covering at least
-`[-9000, 9000]` m) matching `scripts/build_train_pairs.jl`. Horizontal
-cell size is 80 m (v4–v7 used 160 m at the same 19.2 km span).
+`[-9000, 9000]` m) matching `scripts/build_train_pairs.jl`.
 Use [`station_positions`](@ref) for the training x-axis; resample field data
 with `MTInputStandardizer.standardize_mt_input`.
 
@@ -161,14 +160,11 @@ unet_log_periods(n::Integer = UNET_N_PERIODS) =
 Canonical U-Net survey used by `scripts/build_train_pairs.jl`
 (`SyntheticGenerator.GeneratorConfig` defaults):
 
-- profile core: 240 cells × 80 m (`y_core_range = (-9600, 9600)`, 19.2 km)
+- profile core: 120 cells × 160 m (`y_core_range = (-9600, 9600)`, 19.2 km)
   so `station_positions` span at least `[-9000, 9000]` m and COMMEMI's
-  `±8000` m receivers stay in-distribution (v4–v7 used 120 × 160 m;
-  v1–v3 used 120 × 25 m ≈ 3 km)
-- target column: 48 cells × 25 m (unchanged; depth resolution is a
-  separate experiment)
-- 30 stations (every 8th core-cell centre; `receiver_stride = 8`;
-  station spacing stays 640 m)
+  `±8000` m receivers stay in-distribution (v1–v3 used 120 × 25 m ≈ 3 km)
+- target column: 48 cells × 25 m
+- 30 stations (every 4th core-cell centre; `receiver_stride = 4`)
 - 20 log-spaced periods `T = 10.^range(-3, 3, length=20)` s
   (field-MT band; frequencies `f = 1/T ∈ [10⁻³, 10³]` Hz)
 
@@ -177,10 +173,10 @@ prior **network** I/O should use `UNET_MESH` (or a checkpoint `MeshParams`
 with the same survey) via [`station_positions`](@ref).
 """
 const UNET_MESH = MeshParams(
-    240,                                                    # nx  (was 120 at dx=160 m)
-    48,                                                     # nz  — unchanged
-    80.0,                                                   # dx  (m)  — 19.2 km core
-    25.0,                                                   # dz  (m)  — unchanged
+    120,                                                    # nx
+    48,                                                     # nz
+    160.0,                                                  # dx  (m)  — 19.2 km core
+    25.0,                                                   # dz  (m)
     30,                                                     # n_stations
     unet_log_periods(),                                     # T ∈ [1e-3, 1e3] s
 )

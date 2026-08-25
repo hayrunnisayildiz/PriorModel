@@ -1,4 +1,4 @@
-# UNET_MESH (240×80 m, 30×20) ve DEFAULT_MESH (COMMEMI solver) sözleşmesini kilitler.
+# UNET_MESH (120×160 m, 30×20) ve DEFAULT_MESH (COMMEMI solver) sözleşmesini kilitler.
 # Bu grid kayarsa v7 ağırlıkları sessizce uyumsuz boyutta yüklenir / COMMEMI 11×7 ağ girdisi sanılır.
 
 if !isdefined(Main, :MTMeshParams)
@@ -16,9 +16,9 @@ function _mesh_fields_match(a::MeshParams, b::MeshParams; rtol=1e-12, atol=1e-15
 end
 
 @testset "MeshParams round-trip" begin
-    @testset "UNET_MESH is the 240×80 m / 30×20 network survey" begin
-        @test UNET_MESH.nx == 240
-        @test UNET_MESH.dx == 80.0
+    @testset "UNET_MESH is the 120×160 m / 30×20 network survey" begin
+        @test UNET_MESH.nx == 120
+        @test UNET_MESH.dx == 160.0
         @test UNET_MESH.nz == 48
         @test UNET_MESH.dz == 25.0
         @test UNET_MESH.n_stations == 30
@@ -26,7 +26,7 @@ end
         @test n_periods(UNET_MESH) == UNET_N_PERIODS
         @test n_components(UNET_MESH) == 2
         @test n_components(UNET_MESH; tetm=true) == 4
-        @test profile_length(UNET_MESH) == 240 * 80.0
+        @test profile_length(UNET_MESH) == 120 * 160.0
         @test depth_extent(UNET_MESH) == 48 * 25.0
         @test UNET_MESH.periods == unet_log_periods()
         @test first(UNET_MESH.periods) ≈ 1e-3

@@ -12,10 +12,11 @@ Usage (from project root):
     julia --project=. src/training/train_mt_resistivity.jl --resume-from models/mid_scale_prior_v5.jld2 --epochs 60
     julia --project=. src/training/train_mt_resistivity.jl --dataset data/synthetic/train_pairs_v7.h5 --epochs 50 --output models/production_prior_v7.jld2
 
-Colab (cwd is /content — never `--project=.` from there):
-    julia --project=/content/PriorModel /content/PriorModel/src/training/train_mt_resistivity.jl \
-        --dataset /content/PriorModel/data/synthetic/train_pairs.h5 \
-        --commemi-every 0 --no-plot
+Colab (cwd is /content — `cd /content/PriorModel` first, then `--project=.`):
+    julia --project=. src/training/train_mt_resistivity.jl \
+        --dataset data/synthetic/train_pairs_v8_tetm_n200_dx160.h5 \
+        --epochs 15 --commemi-every 5 \
+        --output models/prior_v8_tetm_n200_dx160.jld2
 
 Checkpoint selection: COMMEMI short-VFSA `commemi_rms` is primary (probed every
 `--commemi-every` epochs; default 10, `0` disables the probe). Synthetic
@@ -122,6 +123,7 @@ function parse_cli_args(args::Vector{String})::MTTrainConfig
     commemi_iter = cfg.commemi_iter
     commemi_obs = cfg.commemi_obs
     no_plot = cfg.no_plot
+    lambda_tv = cfg.lambda_tv
     i = 1
     while i <= length(args)
         arg = args[i]
@@ -159,6 +161,8 @@ function parse_cli_args(args::Vector{String})::MTTrainConfig
             commemi_iter = parse(Int, args[i+1]); i += 2; continue
         elseif arg == "--commemi-obs" && i + 1 <= length(args)
             commemi_obs = args[i+1]; i += 2; continue
+        elseif arg == "--lambda-tv" && i + 1 <= length(args)
+            lambda_tv = Float32(parse(Float64, args[i+1])); i += 2; continue
         elseif arg == "--no-plot"
             no_plot = true; i += 1; continue
         end
@@ -167,7 +171,8 @@ function parse_cli_args(args::Vector{String})::MTTrainConfig
     return MTTrainConfig(; dataset, output, epochs, lr, batch_size, clip_norm,
                          base_channels, n_down, training_log, split_json, curve_png,
                          resume_from, resume_log, schedule_epochs,
-                         commemi_every, commemi_iter, commemi_obs, no_plot)
+                         commemi_every, commemi_iter, commemi_obs, no_plot,
+                         lambda_tv)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -706,7 +711,9 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
     N = size(X, 4)
     n_st, n_per, n_comp = size(X, 1), size(X, 2), size(X, 3)
     @info "Dataset loaded" path=cfg.dataset N=N stations=n_st periods=n_per components=n_comp
-    @info "Target grid" nz=mesh.nz nx=mesh.nx
+    @info "Target grid" nz=mesh.nz nx=mesh.nx dx=mesh.dx dz=mesh.dz
+    @printf("  mesh: nx=%d  dx=%.1f m  nz=%d  dz=%.1f m  C_in=%d  commemi_every=%d  epochs=%d\n",
+            mesh.nx, mesh.dx, mesh.nz, mesh.dz, n_comp, cfg.commemi_every, cfg.epochs)
 
     reuse_split = resuming && isfile(cfg.split_json)
     train_idx, val_idx = if reuse_split
