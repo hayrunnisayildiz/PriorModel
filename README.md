@@ -31,8 +31,12 @@ response (`n=1000`, COMMEMI-family scenarios, `commemi_rms` checkpoint).
 
 ## Running on Colab
 
-Open [`notebooks/colab_setup.ipynb`](notebooks/colab_setup.ipynb) and follow the
-cells in order. The same steps from a Colab Python runtime:
+Open [`notebooks/colab_setup.ipynb`](notebooks/colab_setup.ipynb) and run the
+cells in order. Current default: TE+TM
+`train_pairs_v8_tetm_n200.h5` → `models/prior_v8_tetm_n200.jld2`. Keep the
+kernel as **Python 3**; Julia is invoked with
+`julia --project=/content/PriorModel …`. VFSA / `main.jl` stay local
+(MTGeophysics → GLMakie hangs a headless VM).
 
 ### 1. GPU runtime
 
@@ -61,15 +65,17 @@ git -c credential.helper= clone --depth 1 --single-branch --branch master \
 Do not let `git` prompt for a username: a public HTTPS clone waiting on credentials is the usual reason the Colab cell never finishes. If clone still stalls, download the public zip from the same URL (`…/archive/refs/heads/master.zip`). The notebook cell does that automatically after 90 s.
 
 Mount Drive from a Python cell (`from google.colab import drive; drive.mount('/content/drive')`)
-and keep artifacts under `/content/drive/MyDrive/PriorModel/` with the same
-layout as the repo (`data/synthetic/*.h5`, `models/*.jld2`).
+and keep artifacts under the same layout as the repo (`data/synthetic/*.h5`,
+`models/*.jld2`). The notebook searches both
+`/content/drive/MyDrive/PriorModel/` and the nested path
+`MyDrive/PriorModelData/PriorModel/PriorModel/`.
 
 **Never use `--project=.` on Colab.** The notebook cwd is `/content`. That flag
 creates a leftover empty `/content/Project.toml` which then hides this repo's
 environment, so `using HDF5` / `using LuxCUDA` fail. Always pass the clone path:
 
 ```bash
-julia --project=/content/PriorModel -e 'using Pkg; Pkg.instantiate()'
+julia --project=/content/PriorModel -e 'include("/content/PriorModel/src/pkg_setup.jl")'
 ```
 
 If `/content/Project.toml` already exists, delete it.
@@ -77,14 +83,13 @@ If `/content/Project.toml` already exists, delete it.
 ### 3. Data and checkpoints
 
 `data/synthetic/*.h5` and `models/*.jld2` are gitignored (they are large). Copy
-them from Drive with the notebook Python cell (not Julia). On Colab do **not**
-synthesize with `--n 50`: that loads MTGeophysics → GLMakie and the cell hangs.
+them from Drive with the notebook Python cell (not Julia). Prefer
+`train_pairs_v8_tetm_n200.h5` (48×240, 4-channel TE+TM). Do not train on
+`train_pairs_v7.h5` (48×120). The 5 MB `train_pairs.h5` is only a smoke test.
 
-Drive layout on this account (nested):
-
-`MyDrive/PriorModelData/PriorModel/PriorModel/data/synthetic/`
-
-Copy `train_pairs_v7.h5` for training. The 5 MB `train_pairs.h5` is only a smoke test.
+If the HDF5 is missing, the notebook builds it with `xvfb-run` and
+`--tetm --n 200`. A raw `julia … build_train_pairs.jl` on Colab loads
+MTGeophysics → GLMakie and hangs.
 
 ### 4. Train (headless)
 
@@ -96,14 +101,14 @@ and skip the training-curve PNG:
 ```bash
 julia --project=/content/PriorModel \
   /content/PriorModel/src/training/train_mt_resistivity.jl \
-  --dataset /content/PriorModel/data/synthetic/train_pairs_v7.h5 \
+  --dataset /content/PriorModel/data/synthetic/train_pairs_v8_tetm_n200.h5 \
+  --epochs 50 --output /content/PriorModel/models/prior_v8_tetm_n200.jld2 \
   --commemi-every 0 --no-plot
 ```
 
-`--commemi-every` defaults to 10 locally (probe every 10 epochs). The probe
-itself uses the plot-free `run_mt2d_vfsa` API (CairoMakie figures are only
-written by the `VFSA2DMT()` wrapper). The Colab failure is the GLMakie import
-inside MTGeophysics, not our plotting. Keep `--commemi-every 0` on Colab.
+`--commemi-every` defaults to 10 locally (probe every 10 epochs). Keep
+`--commemi-every 0` on Colab. First epoch compiles CUDA/Zygote; 10–20 min
+with no output is normal.
 
 Scripts share one bootstrap (`src/pkg_setup.jl`) that activates `ROOT` no matter
 which directory you start Julia from, as long as `--project` points at the clone.
