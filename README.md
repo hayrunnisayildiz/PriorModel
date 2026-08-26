@@ -33,7 +33,8 @@ response (`n=1000`, COMMEMI-family scenarios, `commemi_rms` checkpoint).
 
 Open [`notebooks/colab_setup.ipynb`](notebooks/colab_setup.ipynb) and run the
 cells in order. Current default: TE+TM
-`train_pairs_v8_tetm_n200.h5` → `models/prior_v8_tetm_n200.jld2`. Keep the
+`train_pairs_deepbody_n1000.h5` → `models/prior_v9_deepbody_n1000.jld2`
+(50 epoch, `--commemi-every 5`, `--commemi-iter 25`). Keep the
 kernel as **Python 3**; Julia is invoked with
 `julia --project=/content/PriorModel …`. VFSA / `main.jl` stay local
 (MTGeophysics → GLMakie hangs a headless VM).
@@ -82,17 +83,20 @@ julia --project=. -e 'include("src/pkg_setup.jl")'
 ### 3. Data and checkpoints
 
 `data/synthetic/*.h5` and `models/*.jld2` are gitignored. Do **not** reuse
-`train_pairs_v8_tetm_n200.h5` (that file is the discarded dx=80 run). Build:
+`train_pairs_v8_tetm_n200.h5` (that file is the discarded dx=80 run). The v9
+set is built on the MacBook and copied onto Drive:
 
 ```bash
-cd /content/PriorModel
-xvfb-run -a julia --project=. scripts/build_train_pairs.jl --n 200 --seed 42 --tetm \
-  --out data/synthetic/train_pairs_v8_tetm_n200_dx160.h5
+# local (already produced)
+# data/synthetic/train_pairs_deepbody_n1000.h5
+
+# on Colab after Drive mount: copy into
+# /content/PriorModel/data/synthetic/train_pairs_deepbody_n1000.h5
 ```
 
-The production log must show `UNET_MESH: nx=120  dx=160.0 m` (v4–v7 contract).
-A raw `julia … build_train_pairs.jl` on Colab loads MTGeophysics → GLMakie
-and hangs unless wrapped in `xvfb-run`.
+Do not regenerate this HDF5 on Colab. The notebook looks under
+`MyDrive/PriorModel/data/synthetic/`. The mesh contract remains
+`UNET_MESH: nx=120  dx=160.0 m`.
 
 ### 4. Train (COMMEMI probe on)
 
@@ -103,12 +107,12 @@ run: val_loss fallback, Phase 1 probe disabled).
 ```bash
 cd /content/PriorModel
 julia --project=. src/training/train_mt_resistivity.jl \
-  --dataset data/synthetic/train_pairs_v8_tetm_n200_dx160.h5 \
-  --epochs 15 --commemi-every 5 \
-  --output models/prior_v8_tetm_n200_dx160.jld2 \
-  --training-log results/training_log_v8_tetm_n200_dx160.csv \
-  --split-json results/train_val_split_v8_tetm_n200_dx160.json \
-  --curve-png results/training_curve_v8_tetm_n200_dx160.png
+  --dataset data/synthetic/train_pairs_deepbody_n1000.h5 \
+  --epochs 50 --commemi-every 5 --commemi-iter 25 \
+  --output models/prior_v9_deepbody_n1000.jld2 \
+  --training-log results/training_log_v9_deepbody_n1000.csv \
+  --split-json results/train_val_split_v9_deepbody_n1000.json \
+  --curve-png results/training_curve_v9_deepbody_n1000.png
 ```
 
 First epoch compiles CUDA/Zygote; 10–20 min with no output is normal.
