@@ -22,6 +22,10 @@ Usage:
     julia --project=. scripts/build_train_pairs.jl --n 200 \
         --scenario-weights "0.02,0.05,0.05,0.05,0.05,0.05,0.05,0.05,0.25,0.25,0.13" \
         --out data/synthetic/train_pairs_commemi_weighted.h5
+    julia --project=. scripts/build_train_pairs.jl --n 300 --tetm \
+        --scenario-weights "0.02,0.05,0.05,0.05,0.03,0.03,0.03,0.03,0.24,0.24,0.23" \
+        --generic-fraction 1.0 \
+        --out data/synthetic/train_pairs_generic_commemi_n300.h5
 
 Colab (cwd is /content — never `--project=.` from there):
     julia --project=/content/PriorModel /content/PriorModel/scripts/build_train_pairs.jl --n 50
@@ -64,6 +68,7 @@ function parse_args(argv::Vector{String})
         :priors => "",
         :tetm => false,
         :scenario_weights => nothing,
+        :generic_fraction => nothing,
     )
     i = 1
     while i <= length(argv)
@@ -81,6 +86,8 @@ function parse_args(argv::Vector{String})
             opts[:tetm] = true
         elseif a == "--scenario-weights"
             opts[:scenario_weights] = parse_scenario_weights(need())
+        elseif a == "--generic-fraction"
+            opts[:generic_fraction] = parse(Float64, need())
         end
         i += 1
     end
@@ -112,15 +119,24 @@ function main(argv::Vector{String}=ARGS)
         priors_path = isfile(default_priors) ? default_priors : ""
     end
 
-    # Only override scenario_weights when --scenario-weights is passed; otherwise
-    # keep GeneratorConfig() defaults so other callers / production builds are unchanged.
-    cfg = if opts[:scenario_weights] === nothing
+    # Only override scenario_weights / generic_fraction when the matching CLI flag
+    # is passed; otherwise keep GeneratorConfig() defaults so other callers /
+    # production builds are unchanged.
+    cfg = if opts[:scenario_weights] === nothing && opts[:generic_fraction] === nothing
         GeneratorConfig()
-    else
+    elseif opts[:scenario_weights] === nothing
+        GeneratorConfig(generic_fraction=opts[:generic_fraction])
+    elseif opts[:generic_fraction] === nothing
         GeneratorConfig(scenario_weights=opts[:scenario_weights])
+    else
+        GeneratorConfig(
+            scenario_weights=opts[:scenario_weights],
+            generic_fraction=opts[:generic_fraction],
+        )
     end
     gmesh = build_generator_mesh(cfg)
     @info "scenario_weights" weights=cfg.scenario_weights scenarios=SCENARIOS
+    @info "generic_fraction" fraction=cfg.generic_fraction range=cfg.generic_log10_range
     priors = if !isempty(priors_path) && isfile(priors_path)
         load_generator_priors(priors_path)
     else

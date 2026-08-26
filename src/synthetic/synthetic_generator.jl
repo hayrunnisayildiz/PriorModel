@@ -1399,9 +1399,9 @@ function build_two_block!(canvas::Matrix{Float64}, ctx::SampleContext)
 
     cover = rand(ctx.rng) < 0.45
     z_top = ctx.zs[1] + (cover ? _uniform(ctx.rng, 0.05, 0.22) * span_z : 0.0)
-    z_bot_l = clamp(z_top + _uniform(ctx.rng, 0.22, 0.70) * (ctx.zs[end] - z_top),
+    z_bot_l = clamp(z_top + _uniform(ctx.rng, 0.22, 0.85) * (ctx.zs[end] - z_top),
                     z_top + 2 * ctx.dz, ctx.zs[end])
-    z_bot_r = clamp(z_top + _uniform(ctx.rng, 0.22, 0.70) * (ctx.zs[end] - z_top),
+    z_bot_r = clamp(z_top + _uniform(ctx.rng, 0.22, 0.85) * (ctx.zs[end] - z_top),
                     z_top + 2 * ctx.dz, ctx.zs[end])
 
     left_kind = rand(ctx.rng) < 0.55 ? :conductive : :resistive
@@ -1454,7 +1454,7 @@ function build_buried_prism!(canvas::Matrix{Float64}, ctx::SampleContext)
     kind = rand(ctx.rng) < 0.7 ? :conductive : :resistive
     value = sample_log10_rho(ctx, kind)
     half_w = 0.5 * _uniform(ctx.rng, 0.10, 0.40) * span_y
-    thick = _uniform(ctx.rng, 0.12, 0.50) * span_z
+    thick = _uniform(ctx.rng, 0.12, 0.85) * span_z
     y0 = _uniform(ctx.rng, ctx.ys[1] + half_w, ctx.ys[end] - half_w)
     z_min = has_cover ? ctx.zs[1] + 0.04 * span_z : ctx.zs[1]
     z_top = _uniform(ctx.rng, z_min, ctx.zs[1] + 0.40 * span_z)
@@ -1488,7 +1488,7 @@ function build_nested_prism!(canvas::Matrix{Float64}, ctx::SampleContext)
     span_y = profile_span(ctx)
     span_z = depth_span(ctx)
     outer_hw = 0.5 * _uniform(ctx.rng, 0.18, 0.50) * span_y
-    outer_hh = 0.5 * _uniform(ctx.rng, 0.20, 0.60) * span_z
+    outer_hh = 0.5 * _uniform(ctx.rng, 0.20, 0.85) * span_z
     y0 = _uniform(ctx.rng, ctx.ys[1] + outer_hw, ctx.ys[end] - outer_hw)
     z0 = _uniform(ctx.rng, ctx.zs[1] + outer_hh, ctx.zs[end] - outer_hh)
 
