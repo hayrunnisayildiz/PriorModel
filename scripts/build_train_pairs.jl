@@ -19,6 +19,9 @@ Usage:
     julia --project=. scripts/build_train_pairs.jl --n 200 --out data/synthetic/train_pairs.h5
     julia --project=. scripts/build_train_pairs.jl --n 200 --tetm \
         --out data/synthetic/train_pairs_v8_tetm_n200.h5
+    julia --project=. scripts/build_train_pairs.jl --n 200 \
+        --scenario-weights "0.02,0.05,0.05,0.05,0.05,0.05,0.05,0.05,0.25,0.25,0.13" \
+        --out data/synthetic/train_pairs_commemi_weighted.h5
 
 Colab (cwd is /content — never `--project=.` from there):
     julia --project=/content/PriorModel /content/PriorModel/scripts/build_train_pairs.jl --n 50
@@ -45,6 +48,14 @@ using .MTInputStandardizer: pack_te_response, pack_tetm_response
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+function parse_scenario_weights(raw::AbstractString)::Vector{Float64}
+    parts = split(raw, ',')
+    length(parts) == length(SCENARIOS) ||
+        error("--scenario-weights needs $(length(SCENARIOS)) floats " *
+              "(order: $(join(SCENARIOS, ", "))), got $(length(parts))")
+    return parse.(Float64, strip.(parts))
+end
+
 function parse_args(argv::Vector{String})
     opts = Dict{Symbol,Any}(
         :n => 50,
@@ -52,6 +63,7 @@ function parse_args(argv::Vector{String})
         :seed => 42,
         :priors => "",
         :tetm => false,
+        :scenario_weights => nothing,
     )
     i = 1
     while i <= length(argv)
@@ -67,6 +79,8 @@ function parse_args(argv::Vector{String})
             opts[:priors] = abspath(need())
         elseif a == "--tetm"
             opts[:tetm] = true
+        elseif a == "--scenario-weights"
+            opts[:scenario_weights] = parse_scenario_weights(need())
         end
         i += 1
     end
@@ -98,8 +112,15 @@ function main(argv::Vector{String}=ARGS)
         priors_path = isfile(default_priors) ? default_priors : ""
     end
 
-    cfg = GeneratorConfig()
+    # Only override scenario_weights when --scenario-weights is passed; otherwise
+    # keep GeneratorConfig() defaults so other callers / production builds are unchanged.
+    cfg = if opts[:scenario_weights] === nothing
+        GeneratorConfig()
+    else
+        GeneratorConfig(scenario_weights=opts[:scenario_weights])
+    end
     gmesh = build_generator_mesh(cfg)
+    @info "scenario_weights" weights=cfg.scenario_weights scenarios=SCENARIOS
     priors = if !isempty(priors_path) && isfile(priors_path)
         load_generator_priors(priors_path)
     else

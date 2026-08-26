@@ -10,6 +10,7 @@ Colab (cwd is /content — do not use --project=. from there):
 
 Prerequisites:
     julia --project=. src/training/train_prior.jl   # produces models/best_prior_model.jld2
+    # (archived copy: archive/3d_keivitsa/models/best_prior_model.jld2)
 
 Pipeline:
   1. Load preprocessed EM volume → keivitsa_preprocessed.h5
@@ -47,6 +48,8 @@ const VoxGridSpecs = GridSpecs
 # ── Paths & constants ───────────────────────────────────────────────────────
 
 const PREPROCESSED_H5 = joinpath(ROOT, "data", "processed", "keivitsa_preprocessed.h5")
+# After restore: read from live models/. Archived copy:
+# archive/3d_keivitsa/models/best_prior_model.jld2 (UnifiedPriorUNet3D, not 2-D MT).
 const MODEL_CHECKPOINT = joinpath(ROOT, "models", "best_prior_model.jld2")
 const OUTPUT_H5 = joinpath(ROOT, "data", "processed", "resistivity_prior_results.h5")
 

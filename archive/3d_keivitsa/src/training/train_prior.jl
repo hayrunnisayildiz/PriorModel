@@ -50,6 +50,8 @@ const GridSpec = GridSpecs.GridSpec
 # ─────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_DATASET = joinpath(ROOT, "data", "processed", "keivitsa_preprocessed.h5")
+# After restore: write to live models/. Archived weights live at
+# archive/3d_keivitsa/models/best_prior_model.jld2 (UnifiedPriorUNet3D, not 2-D MT).
 const DEFAULT_MODEL_OUT = joinpath(ROOT, "models", "best_prior_model.jld2")
 
 # ─────────────────────────────────────────────────────────────────────────────

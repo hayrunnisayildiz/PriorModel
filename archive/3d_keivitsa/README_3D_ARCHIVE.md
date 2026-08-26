@@ -30,6 +30,7 @@ from the 2-D or 3-D U-Net trainers.
 | Path in this archive | Original path |
 |---|---|
 | `main.jl` | repo-root 3-D orchestrator |
+| `models/best_prior_model.jld2` | `models/best_prior_model.jld2` (`UnifiedPriorUNet3D` weights — **not** a 2-D MT checkpoint) |
 | `src/networks/prior_unet3d.jl` | `UnifiedPriorUNet3D` |
 | `src/training/train_prior.jl` | 3-D patch training |
 | `src/training/PriorTrainingLoss.jl` | 3-D well / TV / bounds loss |
@@ -40,6 +41,10 @@ from the 2-D or 3-D U-Net trainers.
 | `src/neural_prior/CBAM3D.jl` | 3-D CBAM (used by the U-Net) |
 | `src/neural_prior/PriorNet3D.jl` | unused `SmartPriorNet3D` |
 | `src/physics_inversion/*` | Nagy gravity / magnetic + L-BFGS |
+
+The checkpoint sat under the live `models/` name with a generic filename and was
+easy to confuse with 2-D MT priors (`mid_scale_prior_v5.jld2`, `prior_v8_*`, …).
+It belongs only to this frozen 3-D line.
 
 Tree layout under `src/` is unchanged so `@__DIR__`-relative includes between
 archived files still match after restore.
@@ -52,7 +57,7 @@ in the live tree. That include works only after restore.
 - `src/analysis/keivitsa_stats.jl` — 2-D synthetic resistivity calibration
 - `scripts/build_keivitsa_priors.jl` — writes `config/keivitsa_priors.*`
 - `src/neural_prior/Losses.jl` — TV / masked-loss helpers (no 3-D network)
-- `src/training/train_mt_resistivity.jl`, `commemi_probe.jl`, `models/`, `results/`
+- `src/training/train_mt_resistivity.jl`, `commemi_probe.jl`, live `models/` (2-D MT checkpoints only), `results/`
 
 ## How to re-open (restore)
 
@@ -72,7 +77,11 @@ git mv archive/3d_keivitsa/src/neural_prior/CBAM3D.jl src/neural_prior/
 git mv archive/3d_keivitsa/src/neural_prior/PriorNet3D.jl src/neural_prior/
 git mv archive/3d_keivitsa/src/physics_inversion/* src/physics_inversion/
 
-# 2. Replace the 2-D wrapper with the 3-D orchestrator
+# 2. Restore the 3-D checkpoint next to other models/
+mkdir -p models
+mv archive/3d_keivitsa/models/best_prior_model.jld2 models/
+
+# 3. Replace the 2-D wrapper with the 3-D orchestrator
 git mv main.jl main_2d_wrapper.jl   # or delete if you no longer need it
 git mv archive/3d_keivitsa/main.jl main.jl
 ```
