@@ -15,4 +15,5 @@ get!(ENV, "GKSwstype", "nul")
     include("test_mesh_params.jl")
     include("test_mt_input_standardizer.jl")
     include("test_ini_export.jl")
+    include("test_mt_prior_loss.jl")
 end

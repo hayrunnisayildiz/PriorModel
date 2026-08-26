@@ -6,6 +6,10 @@ Loss:
     L_total = λ_data · L1(predicted, true_log10ρ)
             + λ_tv  · TotalVariation(predicted)
 
+`--loss-weighted` replaces the L1 term with a pixel-weighted variant
+(anomaly pixels, i.e. those far from the per-sample spatial median of the
+target, are up-weighted by `1 + λ_boundary * |target − median|`).
+
 Usage (from project root):
     julia --project=. src/training/train_mt_resistivity.jl
     julia --project=. src/training/train_mt_resistivity.jl --dataset data/synthetic/train_pairs.h5 --epochs 80
@@ -17,6 +21,16 @@ Colab (cwd is /content — `cd /content/PriorModel` first, then `--project=.`):
         --dataset data/synthetic/train_pairs_v8_tetm_n200_dx160.h5 \
         --epochs 15 --commemi-every 5 \
         --output models/prior_v8_tetm_n200_dx160.jld2
+
+Weighted-L1 A/B on the same v8 pairs (do not overwrite the unweighted ckpt):
+    julia --project=. src/training/train_mt_resistivity.jl \
+        --dataset data/synthetic/train_pairs_v8_tetm_n200_dx160.h5 \
+        --epochs 15 --commemi-every 5 \
+        --loss-weighted \
+        --output models/prior_v8_tetm_weighted_n200_dx160.jld2 \
+        --training-log results/training_log_v8_tetm_weighted_n200_dx160.csv \
+        --split-json results/train_val_split_v8_tetm_weighted_n200_dx160.json \
+        --curve-png results/training_curve_v8_tetm_weighted_n200_dx160.png
 
 Checkpoint selection: COMMEMI short-VFSA `commemi_rms` is primary (probed every
 `--commemi-every` epochs; default 10, `0` disables the probe). Synthetic
@@ -101,6 +115,8 @@ Base.@kwdef struct MTTrainConfig
     commemi_iter::Int     = 25              # short VFSA iterations (full eval uses 100)
     commemi_obs::String   = joinpath(ROOT, "examples", "0COMEMI2D-I", "Comemi2D1.obs")
     no_plot::Bool         = false           # skip training-curve PNG (Colab / headless)
+    loss_weighted::Bool   = false           # pixel-weighted L1 (anomaly-focused)
+    lambda_boundary::Float32 = 5.0f0        # scale of |target − median| weight
 end
 
 function parse_cli_args(args::Vector{String})::MTTrainConfig
@@ -124,6 +140,8 @@ function parse_cli_args(args::Vector{String})::MTTrainConfig
     commemi_obs = cfg.commemi_obs
     no_plot = cfg.no_plot
     lambda_tv = cfg.lambda_tv
+    loss_weighted = cfg.loss_weighted
+    lambda_boundary = cfg.lambda_boundary
     i = 1
     while i <= length(args)
         arg = args[i]
@@ -163,6 +181,10 @@ function parse_cli_args(args::Vector{String})::MTTrainConfig
             commemi_obs = args[i+1]; i += 2; continue
         elseif arg == "--lambda-tv" && i + 1 <= length(args)
             lambda_tv = Float32(parse(Float64, args[i+1])); i += 2; continue
+        elseif arg == "--lambda-boundary" && i + 1 <= length(args)
+            lambda_boundary = Float32(parse(Float64, args[i+1])); i += 2; continue
+        elseif arg == "--loss-weighted"
+            loss_weighted = true; i += 1; continue
         elseif arg == "--no-plot"
             no_plot = true; i += 1; continue
         end
@@ -172,7 +194,7 @@ function parse_cli_args(args::Vector{String})::MTTrainConfig
                          base_channels, n_down, training_log, split_json, curve_png,
                          resume_from, resume_log, schedule_epochs,
                          commemi_every, commemi_iter, commemi_obs, no_plot,
-                         lambda_tv)
+                         lambda_tv, loss_weighted, lambda_boundary)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -307,7 +329,8 @@ function train_step!(model::MTResistivityUNet2D, ps, st, opt_state,
                      x_batch::AbstractArray{Float32,4},
                      y_batch::AbstractArray{Float32,3},
                      use_gpu::Bool;
-                     λ_data::Float32, λ_tv::Float32)
+                     λ_data::Float32, λ_tv::Float32,
+                     weighted::Bool=false, λ_boundary::Float32=5.0f0)
     x = to_device(x_batch, Val(use_gpu))
     y = to_device(y_batch, Val(use_gpu))
     st_train = Lux.trainmode(st)
@@ -315,14 +338,16 @@ function train_step!(model::MTResistivityUNet2D, ps, st, opt_state,
     loss_and_grad = Zygote.withgradient(ps) do p
         gpu_forward(use_gpu) do
             pred, _ = model(x, p, st_train)
-            mt_prior_loss_terms(pred, y; λ_data=λ_data, λ_tv=λ_tv).total
+            mt_prior_loss_terms(pred, y; λ_data=λ_data, λ_tv=λ_tv,
+                                weighted=weighted, λ_boundary=λ_boundary).total
         end
     end
 
     pred, st_new = gpu_forward(use_gpu) do
         model(x, ps, st_train)
     end
-    terms = mt_prior_loss_terms(pred, y; λ_data=λ_data, λ_tv=λ_tv)
+    terms = mt_prior_loss_terms(pred, y; λ_data=λ_data, λ_tv=λ_tv,
+                                weighted=weighted, λ_boundary=λ_boundary)
     Optimisers.update!(opt_state, ps, loss_and_grad.grad[1])
     return terms, st_new
 end
@@ -335,7 +360,8 @@ Uses `Lux.testmode` so dropout / batch-norm (if present) run in eval mode.
 function eval_split_loss(model::MTResistivityUNet2D, ps, st,
                          X::AbstractArray{Float32,4}, Y::AbstractArray{Float32,3},
                          indices::Vector{Int}, batch_size::Int, use_gpu::Bool;
-                         λ_data::Float32, λ_tv::Float32)::Float32
+                         λ_data::Float32, λ_tv::Float32,
+                         weighted::Bool=false, λ_boundary::Float32=5.0f0)::Float32
     st_eval = Lux.testmode(st)
     acc = 0.0f0
     n = 0
@@ -350,7 +376,8 @@ function eval_split_loss(model::MTResistivityUNet2D, ps, st,
         pred, _ = gpu_forward(use_gpu) do
             model(x, ps, st_eval)
         end
-        terms = mt_prior_loss_terms(pred, y; λ_data=λ_data, λ_tv=λ_tv)
+        terms = mt_prior_loss_terms(pred, y; λ_data=λ_data, λ_tv=λ_tv,
+                                    weighted=weighted, λ_boundary=λ_boundary)
         bsz = length(idx)
         acc += Float32(terms.total) * Float32(bsz)
         n += bsz
@@ -789,6 +816,8 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
 
     λ_data = cfg.lambda_data
     λ_tv   = cfg.lambda_tv
+    weighted = cfg.loss_weighted
+    λ_boundary = cfg.lambda_boundary
 
     best_val_loss = resuming ? Float32(resume_ckpt.best_loss) : Inf32
     best_commemi_rms = resuming ? Float64(resume_ckpt.best_commemi_rms) : NaN
@@ -847,6 +876,8 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
             N, length(train_idx), length(val_idx), cfg.batch_size, cfg.clip_norm)
     @printf("  λ_data=%.2e  λ_tv=%.2e  lr_max=%.2e  (cosine annealing)\n",
             λ_data, λ_tv, cfg.lr)
+    @printf("  weighted=%s  λ_boundary=%.2e\n",
+            weighted ? "true" : "false", λ_boundary)
     println("  checkpoint selection: commemi_rms (primary) / val_loss (fallback) → ",
             cfg.output)
     flush(stdout)
@@ -871,7 +902,8 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
         for idx in epoch_minibatches(rng, train_idx, cfg.batch_size)
             xb, yb = sample_batch(X, Y, idx)
             terms, st = train_step!(model, ps, st, opt_state, xb, yb, use_gpu;
-                                    λ_data=λ_data, λ_tv=λ_tv)
+                                    λ_data=λ_data, λ_tv=λ_tv,
+                                    weighted=weighted, λ_boundary=λ_boundary)
             if !first_step_logged
                 _say("  first GPU train step finished (compile done)")
                 first_step_logged = true
@@ -889,7 +921,8 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
         avg_tv    = epoch_tv    / Float32(n_seen)
 
         avg_val = eval_split_loss(model, ps, st, X, Y, val_idx, cfg.batch_size, use_gpu;
-                                  λ_data=λ_data, λ_tv=λ_tv)
+                                  λ_data=λ_data, λ_tv=λ_tv,
+                                  weighted=weighted, λ_boundary=λ_boundary)
 
         if avg_train == avg_val
             @warn "train_loss == val_loss exactly; check that split indices differ" epoch=epoch avg_train=avg_train
@@ -993,6 +1026,7 @@ function main(cfg::MTTrainConfig=MTTrainConfig())
             train_idx[1:min(3, length(train_idx))],
             " vs ",
             val_idx[1:min(3, length(val_idx))])
+    println("  loss_weighted=", weighted, "  λ_boundary=", λ_boundary)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
