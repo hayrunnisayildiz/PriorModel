@@ -1,0 +1,32 @@
+Eleven-way COMMEMI RMS comparison (1 chain, 200 ctrl, 100 iter, seed=20260308)
+v8 checkpoint: /Users/hayrunnisayildiz/PriorModel/models/prior_v8_tetm_n200_dx160.jld2
+VFSA run_dir:  /Users/hayrunnisayildiz/PriorModel/scripts/run_VFSA2DMT_20260825_214440
+T_ood (COMMEMI ⊂ eğitim T): false
+x_ood (COMMEMI ⊂ eğitim x): 0/11
+params: this=16303736  v4_layout=6386036  v5_layout=15689336  (×2.46)
+mesh: nz=48 nx=120 dx=160.0 m dz=25.0 m
+
+  Homojen:                                                    initial=12.3100       best=5.7354      
+  U-Net (20/10ep):                                            initial=61.5000       best=8.3573      
+  U-Net (180/25ep, v1):                                       initial=54.3900       best=9.9083      
+  U-Net (180/25ep, v2, dar):                                  initial=7.9178        best=4.8981      
+  U-Net (180/25ep, v3, gT):                                   initial=9.1006        best=4.9095      
+  U-Net (180/25ep, v4, gT+x):                                 initial=62.6500       best=18.8611     
+  U-Net (400/35ep, v5, gT+x, büyük kapasite):                 initial=39.8638       best=11.8539     
+  U-Net (400/60ep, v6, v5 devam):                             initial=37.4294       best=13.3179     
+  U-Net (1000/50ep, v7, senaryo+commemi_rms):                 initial=38.5600       best=12.4032     
+  U-Net (200/15ep, v8 TE+TM, dx=160):                         initial=33.3637       best=10.7045     
+  Gerçek model (sanity):                                      initial=1.3000        best=1.3002      
+
+Grid RMSE (pred vs true, log10 Ω·m): v8=0.9028  v7=1.0633  Δ=-0.1605
+
+v8 vs homojen (5.7354):  Δbest=+4.9691   homojeni GEÇMEDİ
+v8 vs v7     (12.4032):  Δbest=-1.6987   v7'den iyi
+v8 vs v5     (11.8539):  Δbest=-1.1494   v5'ten iyi
+
+v4–v8 mesh: T∈[1e-3,1e3] s, dx=160 m, nx=120 (same UNET_MESH)
+v8 data: n=200, 15 epochs, --commemi-every 5, TE+TM 4-channel
+Yorum: DUR: v8 grid RMSE=0.9028 v7 (1.0633) ile aynı mertebede (Δ=-0.1605, eşik <0.7). Çözünürlük tek başına açıklamıyor — n=1000'e çıkmadan pred-vs-true hata haritasını görselleştir (mimari / kayıp / forward-eğitim hatası). VFSA best=10.7045 vs v7=12.4032 vs homojen=5.7354.
+
+See also: results/KNOWN_LIMITATIONS.md
+Training curve: results/training_curve_v8_tetm_n200_dx160.png

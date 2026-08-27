@@ -1,0 +1,32 @@
+Eleven-way COMMEMI RMS comparison (1 chain, 200 ctrl, 100 iter, seed=20260308)
+checkpoint: /Users/hayrunnisayildiz/PriorModel/models/prior_v9_deepbody_n1000.jld2
+VFSA run_dir:  /Users/hayrunnisayildiz/PriorModel/scripts/run_VFSA2DMT_20260826_184753
+T_ood (COMMEMI ⊂ eğitim T): false
+x_ood (COMMEMI ⊂ eğitim x): 0/11
+params: this=16303736  v4_layout=6386036  v5_layout=15689336  (×2.46)
+mesh: nz=48 nx=120 dx=160.0 m dz=25.0 m
+
+  Homojen:                                                    initial=12.3100       best=5.7354      
+  U-Net (20/10ep):                                            initial=61.5000       best=8.3573      
+  U-Net (180/25ep, v1):                                       initial=54.3900       best=9.9083      
+  U-Net (180/25ep, v2, dar):                                  initial=7.9178        best=4.8981      
+  U-Net (180/25ep, v3, gT):                                   initial=9.1006        best=4.9095      
+  U-Net (180/25ep, v4, gT+x):                                 initial=62.6500       best=18.8611     
+  U-Net (400/35ep, v5, gT+x, büyük kapasite):                 initial=39.8638       best=11.8539     
+  U-Net (400/60ep, v6, v5 devam):                             initial=37.4294       best=13.3179     
+  U-Net (1000/50ep, v7, senaryo+commemi_rms):                 initial=38.5600       best=12.4032     
+  U-Net (1000/50ep, v9 deepbody TE+TM):                       initial=25.5686       best=8.6294      
+  Gerçek model (sanity):                                      initial=1.3000        best=1.3002      
+
+Grid RMSE (pred vs true, log10 Ω·m): v9=0.7698  v7=1.0633  Δ=-0.2935
+
+v9 vs homojen (5.7354):  Δbest=+2.8940   homojeni GEÇMEDİ
+v9 vs v7     (12.4032):  Δbest=-3.7738   v7'den iyi
+v9 vs v5     (11.8539):  Δbest=-3.2245   v5'ten iyi
+
+v4+ mesh: T∈[1e-3,1e3] s, dx=160 m, nx=120 (same UNET_MESH)
+v9 data: train_pairs_deepbody_n1000.h5, 50 epochs, --commemi-every 5, --commemi-iter 25, TE+TM 4-channel
+Yorum: DUR: v9 grid RMSE=0.7698 v7 (1.0633) ile aynı mertebede (Δ=-0.2935, eşik <0.7). Pred-vs-true hata haritasını görselleştir (mimari / kayıp / forward-eğitim hatası). VFSA best=8.6294 vs v7=12.4032 vs homojen=5.7354.
+
+See also: results/KNOWN_LIMITATIONS.md
+Training curve: results/training_curve_v9_deepbody_n1000.png

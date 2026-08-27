@@ -1,0 +1,26 @@
+Data coverage check
+  training set : data/synthetic/train_pairs_commemi_heavy_n500.h5  (n_models=500, tetm=true)
+  COMMEMI      : /Users/hayrunnisayildiz/PriorModel/examples/0COMEMI2D-I/Comemi2D1.obs
+
+PCA variance explained (top 5 components):
+  PC1: 37.52%
+  PC2: 18.29%
+  PC3: 9.25%
+  PC4: 5.89%
+  PC5: 4.86%
+  cumulative  : 75.81%
+
+COMMEMI position on each PC (train mean=0, train std=1 by definition of z-score):
+  PC1: commemi=69.488   train_std=230.121   z-score=0.30
+  PC2: commemi=141.845   train_std=160.688   z-score=0.88
+  PC3: commemi=14.908   train_std=114.277   z-score=0.13
+  PC4: commemi=-61.877   train_std=91.148   z-score=-0.68
+  PC5: commemi=-105.255   train_std=82.842   z-score=-1.27
+
+Median training nearest-neighbor distance : 156.1921
+COMMEMI nearest-neighbor distance to train : 294.4486
+Ratio (COMMEMI / median train NN)          : 1.89
+
+=> COMMEMI is at the EDGE of the training distribution (nn_ratio 1.5-3x).
+   Partial coverage: some representative scenarios help, but density
+   around COMMEMI-like structures should be increased.

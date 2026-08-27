@@ -1,0 +1,14 @@
+Six-way COMMEMI RMS comparison (1 chain, 200 ctrl, 100 iter, seed=20260308)
+v3 checkpoint: models/mid_scale_prior_v3.jld2
+VFSA run_dir:  /Users/hayrunnisayildiz/PriorModel/scripts/run_VFSA2DMT_20260819_160907
+T_ood (COMMEMI ⊂ eğitim T): false
+
+  Homojen:                                      initial=12.3100       best=5.7354      
+  U-Net (20/10ep):                              initial=61.5000       best=8.3573      
+  U-Net (180/25ep, v1):                         initial=54.3900       best=9.9083      
+  U-Net (180/25ep, v2, dar periyot):            initial=7.9178        best=4.8981      
+  U-Net (180/25ep, v3, geniş periyot):          initial=9.1006        best=4.9095      
+  Gerçek model (sanity):                        initial=1.3000        best=1.3002      
+
+v2 = dar T∈[1e-4, 0.1] s; v3 = geniş T∈[1e-3, 1e3] s
+Yorum: OOD sorunu v2 sonucunu bozmuyormuş, gerçek öğrenme doğrulandı, production'a güvenle geçilebilir

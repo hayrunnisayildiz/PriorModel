@@ -14,6 +14,9 @@ figures/
 run_VFSA2DMT_*/
 scripts/run_VFSA2DMT_*/
 
+.venv/
+.mplconfig/
+
 .DS_Store
 *.jl.cov
 *.jl.*.cov

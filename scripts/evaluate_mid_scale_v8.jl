@@ -1,16 +1,17 @@
 #!/usr/bin/env julia
 #=
-Evaluate models/prior_v8_tetm_n200_dx160.jld2 on the COMMEMI 2-D benchmark.
+COMMEMI 2-D-I evaluation harness (same VFSA settings as v4–v8).
 
-v8 TE+TM = same UNET_MESH as v4–v7 (dx=160 m, nx=120), n=200 pairs,
-15 epochs, --commemi-every 5, 4-channel input
-[log10 ρ_TE, phase_TE, log10 ρ_TM, phase_TM]. COMMEMI is packed with
-`pack_tetm_response` so C_in matches training.
+Default checkpoint is v8 TE+TM (n=200, 15 ep, dx=160). Pass any later
+checkpoint as ARGS[1]; table labels, footnotes, and the prior `.ini`
+name are taken from the checkpoint stem so a v9 run is not reported as v8.
 
-Usage (from project root):
+    Usage (from project root):
     julia --project=. scripts/evaluate_mid_scale_v8.jl
     julia --project=. scripts/evaluate_mid_scale_v8.jl \
         models/prior_v8_tetm_n200_dx160.jld2 results/evaluate_v8_tetm_dx160
+    julia --project=. scripts/evaluate_mid_scale_v8.jl \
+        models/prior_v9_deepbody_n1000.jld2 results/evaluate_v9_deepbody_n1000
 =#
 
 include(joinpath(@__DIR__, "..", "src", "pkg_setup.jl"))
@@ -227,29 +228,67 @@ end
 
 fmt(x) = x === nothing ? "N/A" : @sprintf("%.4f", x)
 
+"""Stem of a checkpoint path, e.g. `prior_v9_deepbody_n1000`."""
+function checkpoint_tag(path::String)
+    return replace(basename(path), r"\.(jld2|JLD2)$" => "")
+end
+
+function short_version(tag::String)
+    m = match(r"v\d+", tag)
+    return m === nothing ? tag : String(m.match)
+end
+
+function table_row_label(tag::String)
+    occursin("v9_deepbody", tag) && return "U-Net (1000/50ep, v9 deepbody TE+TM):"
+    occursin("v8_tetm", tag)     && return "U-Net (200/15ep, v8 TE+TM, dx=160):"
+    return "U-Net ($tag):"
+end
+
+function data_footnote(tag::String)
+    occursin("v9_deepbody", tag) &&
+        return "v9 data: train_pairs_deepbody_n1000.h5, 50 epochs, --commemi-every 5, --commemi-iter 25, TE+TM 4-channel"
+    occursin("v8_tetm", tag) &&
+        return "v8 data: n=200, 15 epochs, --commemi-every 5, TE+TM 4-channel"
+    return "checkpoint: $tag"
+end
+
+function training_curve_relpath(tag::String)
+    occursin("v9_deepbody", tag) && return "results/training_curve_v9_deepbody_n1000.png"
+    occursin("v8_tetm", tag)     && return "results/training_curve_v8_tetm_n200_dx160.png"
+    return "results/training_curve_$(tag).png"
+end
+
 """Go/stop on pred-vs-true grid RMSE (primary) plus VFSA best RMS (context)."""
-function interpret_v8(v8_best, grid_rmse)
+function interpret_run(best_rms, grid_rmse, tag::String)
+    ver = short_version(tag)
     if grid_rmse === nothing
-        return "v8 grid RMSE hesaplanamadı — DUR, çıktıyı kontrol edin."
+        return "$ver grid RMSE hesaplanamadı — DUR, çıktıyı kontrol edin."
     end
     delta = grid_rmse - V7_GRID_RMSE
     if grid_rmse < RMSE_CONTINUE
-        msg = "DEVAM ET: v8 grid RMSE=$(round(grid_rmse; digits=4)) < $(RMSE_CONTINUE) " *
-              "(v7=$(V7_GRID_RMSE), Δ=$(round(delta; digits=4))). " *
-              "TE+TM n=200, dx=160 grid RMSE eşiğin altında — n=1000 ayrı bir karar."
+        msg = "DEVAM ET: $ver grid RMSE=$(round(grid_rmse; digits=4)) < $(RMSE_CONTINUE) " *
+              "(v7=$(V7_GRID_RMSE), Δ=$(round(delta; digits=4)))."
+        occursin("v8_tetm", tag) &&
+            (msg *= " TE+TM n=200, dx=160 grid RMSE eşiğin altında — n=1000 ayrı bir karar.")
     else
-        msg = "DUR: v8 grid RMSE=$(round(grid_rmse; digits=4)) v7 ($(V7_GRID_RMSE)) ile " *
-              "aynı mertebede (Δ=$(round(delta; digits=4)), eşik <$(RMSE_CONTINUE)). " *
-              "Çözünürlük tek başına açıklamıyor — n=1000'e çıkmadan pred-vs-true " *
-              "hata haritasını görselleştir (mimari / kayıp / forward-eğitim hatası)."
+        msg = "DUR: $ver grid RMSE=$(round(grid_rmse; digits=4)) v7 ($(V7_GRID_RMSE)) ile " *
+              "aynı mertebede (Δ=$(round(delta; digits=4)), eşik <$(RMSE_CONTINUE))."
+        if occursin("v8_tetm", tag)
+            msg *= " Çözünürlük tek başına açıklamıyor — n=1000'e çıkmadan pred-vs-true " *
+                   "hata haritasını görselleştir (mimari / kayıp / forward-eğitim hatası)."
+        else
+            msg *= " Pred-vs-true hata haritasını görselleştir (mimari / kayıp / forward-eğitim hatası)."
+        end
     end
-    if v8_best !== nothing
-        msg *= " VFSA best=$(round(v8_best; digits=4)) vs v7=$(V7_BEST) vs homojen=$(HOMO_BEST)."
+    if best_rms !== nothing
+        msg *= " VFSA best=$(round(best_rms; digits=4)) vs v7=$(V7_BEST) vs homojen=$(HOMO_BEST)."
     end
     return msg
 end
 
-function print_eleven_way_table(v8_init, v8_best)
+function print_eleven_way_table(run_init, run_best, tag::String)
+    ver = short_version(tag)
+    row = table_row_label(tag)
     println("─" ^ 88)
     @printf("  %-58s  initial=%-12s  best=%-12s\n",
             "Homojen:", fmt(HOMO_INIT), fmt(HOMO_BEST))
@@ -270,27 +309,27 @@ function print_eleven_way_table(v8_init, v8_best)
     @printf("  %-58s  initial=%-12s  best=%-12s\n",
             "U-Net (1000/50ep, v7, senaryo+commemi_rms):", fmt(V7_INIT), fmt(V7_BEST))
     @printf("  %-58s  initial=%-12s  best=%-12s\n",
-            "U-Net (200/15ep, v8 TE+TM, dx=160):", fmt(v8_init), fmt(v8_best))
+            row, fmt(run_init), fmt(run_best))
     @printf("  %-58s  initial=%-12s  best=%-12s\n",
             "Gerçek model (sanity):", fmt(TRUE_INIT), fmt(TRUE_BEST))
     println("─" ^ 88)
-    println("  v4–v8 mesh: T∈[1e-3,1e3] s, dx=160 m, nx=120 (same UNET_MESH)")
-    if v8_best !== nothing
+    println("  v4+ mesh: T∈[1e-3,1e3] s, dx=160 m, nx=120 (same UNET_MESH)")
+    if run_best !== nothing
         println()
-        @printf("  v8 vs homojen (5.7354):  Δbest=%+.4f   %s\n",
-                v8_best - HOMO_BEST,
-                v8_best < HOMO_BEST ? "HOMOJENİ GEÇTİ" : "homojeni GEÇMEDİ")
-        @printf("  v8 vs v7     (12.4032):  Δbest=%+.4f   %s\n",
-                v8_best - V7_BEST,
-                v8_best < V7_BEST ? "v7'den iyi" : "v7'den kötü/eşit")
-        @printf("  v8 vs v5     (11.8539):  Δbest=%+.4f   %s\n",
-                v8_best - V5_BEST,
-                v8_best < V5_BEST ? "v5'ten iyi" : "v5'ten kötü/eşit")
+        @printf("  %s vs homojen (5.7354):  Δbest=%+.4f   %s\n",
+                ver, run_best - HOMO_BEST,
+                run_best < HOMO_BEST ? "HOMOJENİ GEÇTİ" : "homojeni GEÇMEDİ")
+        @printf("  %s vs v7     (12.4032):  Δbest=%+.4f   %s\n",
+                ver, run_best - V7_BEST,
+                run_best < V7_BEST ? "v7'den iyi" : "v7'den kötü/eşit")
+        @printf("  %s vs v5     (11.8539):  Δbest=%+.4f   %s\n",
+                ver, run_best - V5_BEST,
+                run_best < V5_BEST ? "v5'ten iyi" : "v5'ten kötü/eşit")
     end
 end
 
 function plot_predicted_vs_true(pred::Matrix{Float32}, truth::Matrix{Float32},
-                                out_png::String)
+                                out_png::String; pred_title::String="U-Net prior")
     lo = min(minimum(pred), minimum(truth))
     hi = max(maximum(pred), maximum(truth))
     if hi - lo < 1.0f-3
@@ -304,7 +343,7 @@ function plot_predicted_vs_true(pred::Matrix{Float32}, truth::Matrix{Float32},
         colorbar_title="log₁₀(ρ) [Ω·m]",
         aspect_ratio=:equal)
     p_pred = Plots.heatmap(pred;
-        title="U-Net v8 TE+TM prior (dx=160 m)",
+        title=pred_title,
         xlabel="Profile cell", ylabel="Depth cell",
         yflip=true, color=:turbo, clims=(lo, hi),
         colorbar_title="log₁₀(ρ) [Ω·m]",
@@ -327,19 +366,22 @@ function main()
                    joinpath(ROOT, "models", "prior_v8_tetm_n200_dx160.jld2")
     results_dir  = length(ARGS) >= 2 ? abspath(ARGS[2]) :
                    joinpath(ROOT, "results", "evaluate_v8_tetm_dx160")
+    tag          = checkpoint_tag(checkpoint)
+    ver          = short_version(tag)
     vfsa_data    = joinpath(ROOT, "examples", "0COMEMI2D-I", "Comemi2D1.obs")
     true_model   = joinpath(ROOT, "examples", "0COMEMI2D-I", "Comemi2D1.true")
     mkpath(results_dir)
 
-    isfile(checkpoint) || error("v8 checkpoint not found: $checkpoint")
+    isfile(checkpoint) || error("checkpoint not found: $checkpoint")
     isfile(vfsa_data)  || error("COMMEMI obs not found: $vfsa_data")
     isfile(true_model) || error("COMMEMI true model not found: $true_model")
 
     println("═" ^ 88)
-    println(" v8 TE+TM: U-Net (200/15ep, dx=160 m, nx=120, commemi-every 5, 4-channel)")
+    println(" $ver COMMEMI eval: $tag")
     println("═" ^ 88)
     println("  checkpoint: ", checkpoint)
     println("  results:    ", results_dir)
+    println("  ", data_footnote(tag))
 
     # ── Step 1: COMMEMI MT → prior .ini ──────────────────────────────────────
     println("\n[1/4] Generating COMMEMI prior from ", basename(checkpoint), "...")
@@ -364,9 +406,9 @@ function main()
     mt_h5 = write_mt_h5(joinpath(results_dir, "commemi_mt.h5"), mt_data)
     println("  COMMEMI MT tensor ", size(mt_data), " → $mt_h5")
 
-    prior_ini = joinpath(results_dir, "prior_v8_tetm.ini")
+    prior_ini = joinpath(results_dir, "$(tag).ini")
     generate_prior(mt_h5, checkpoint, prior_ini;
-                   title="U-Net prior v8 TE+TM (200 samples, 15 ep, dx=160 m)")
+                   title="U-Net $ver prior ($tag)")
     println("  → $prior_ini")
 
     pred_logres = predict_prior(model, ps, st, mt_data)
@@ -389,28 +431,29 @@ function main()
     run_dir = result.run_info.run_dir
     @info "VFSA2DMT complete" dir=run_dir
 
-    v8_init = extract_initial_rms(run_dir)
-    v8_best = extract_best_rms(run_dir)
+    run_init = extract_initial_rms(run_dir)
+    run_best = extract_best_rms(run_dir)
 
     # ── Step 3: Eleven-way table + go/stop ───────────────────────────────────
     println("\n[3/4] Eleven-way RMS comparison")
-    print_eleven_way_table(v8_init, v8_best)
-    interpretation = interpret_v8(v8_best, rmse)
+    print_eleven_way_table(run_init, run_best, tag)
+    interpretation = interpret_run(run_best, rmse, tag)
     println()
     println("  T_ood: ", T_ood, T_ood ? "  (COMMEMI hâlâ eğitim bandı dışında)" :
                                         "  (COMMEMI eğitim bandının içinde)")
     println("  x_ood: ", x_ood, "/", length(src_x),
             x_ood == 0 ? "  (COMMEMI eğitim x-bandının içinde)" :
                          "  (istasyon clamp)")
-    @printf("  Grid RMSE v8=%.4f  v7=%.4f  Δ=%+.4f  (continue if v8 < %.2f)\n",
-            rmse, V7_GRID_RMSE, rmse - V7_GRID_RMSE, RMSE_CONTINUE)
+    @printf("  Grid RMSE %s=%.4f  v7=%.4f  Δ=%+.4f  (continue if %s < %.2f)\n",
+            ver, rmse, V7_GRID_RMSE, rmse - V7_GRID_RMSE, ver, RMSE_CONTINUE)
     println("  Yorum: ", interpretation)
     println()
 
     table_path = joinpath(results_dir, "comparison.txt")
+    row = table_row_label(tag)
     open(table_path, "w") do io
         println(io, "Eleven-way COMMEMI RMS comparison (1 chain, 200 ctrl, 100 iter, seed=20260308)")
-        println(io, "v8 checkpoint: $checkpoint")
+        println(io, "checkpoint: $checkpoint")
         println(io, "VFSA run_dir:  $run_dir")
         println(io, "T_ood (COMMEMI ⊂ eğitim T): $T_ood")
         println(io, "x_ood (COMMEMI ⊂ eğitim x): $x_ood/$(length(src_x))")
@@ -437,38 +480,39 @@ function main()
         @printf(io, "  %-58s  initial=%-12s  best=%-12s\n",
                 "U-Net (1000/50ep, v7, senaryo+commemi_rms):", fmt(V7_INIT), fmt(V7_BEST))
         @printf(io, "  %-58s  initial=%-12s  best=%-12s\n",
-                "U-Net (200/15ep, v8 TE+TM, dx=160):", fmt(v8_init), fmt(v8_best))
+                row, fmt(run_init), fmt(run_best))
         @printf(io, "  %-58s  initial=%-12s  best=%-12s\n",
                 "Gerçek model (sanity):", fmt(TRUE_INIT), fmt(TRUE_BEST))
         println(io, "")
-        @printf(io, "Grid RMSE (pred vs true, log10 Ω·m): v8=%.4f  v7=%.4f  Δ=%+.4f\n",
-                rmse, V7_GRID_RMSE, rmse - V7_GRID_RMSE)
+        @printf(io, "Grid RMSE (pred vs true, log10 Ω·m): %s=%.4f  v7=%.4f  Δ=%+.4f\n",
+                ver, rmse, V7_GRID_RMSE, rmse - V7_GRID_RMSE)
         println(io, "")
-        if v8_best !== nothing
-            @printf(io, "v8 vs homojen (5.7354):  Δbest=%+.4f   %s\n",
-                    v8_best - HOMO_BEST,
-                    v8_best < HOMO_BEST ? "HOMOJENİ GEÇTİ" : "homojeni GEÇMEDİ")
-            @printf(io, "v8 vs v7     (12.4032):  Δbest=%+.4f   %s\n",
-                    v8_best - V7_BEST,
-                    v8_best < V7_BEST ? "v7'den iyi" : "v7'den kötü/eşit")
-            @printf(io, "v8 vs v5     (11.8539):  Δbest=%+.4f   %s\n",
-                    v8_best - V5_BEST,
-                    v8_best < V5_BEST ? "v5'ten iyi" : "v5'ten kötü/eşit")
+        if run_best !== nothing
+            @printf(io, "%s vs homojen (5.7354):  Δbest=%+.4f   %s\n",
+                    ver, run_best - HOMO_BEST,
+                    run_best < HOMO_BEST ? "HOMOJENİ GEÇTİ" : "homojeni GEÇMEDİ")
+            @printf(io, "%s vs v7     (12.4032):  Δbest=%+.4f   %s\n",
+                    ver, run_best - V7_BEST,
+                    run_best < V7_BEST ? "v7'den iyi" : "v7'den kötü/eşit")
+            @printf(io, "%s vs v5     (11.8539):  Δbest=%+.4f   %s\n",
+                    ver, run_best - V5_BEST,
+                    run_best < V5_BEST ? "v5'ten iyi" : "v5'ten kötü/eşit")
             println(io, "")
         end
-        println(io, "v4–v8 mesh: T∈[1e-3,1e3] s, dx=160 m, nx=120 (same UNET_MESH)")
-        println(io, "v8 data: n=200, 15 epochs, --commemi-every 5, TE+TM 4-channel")
+        println(io, "v4+ mesh: T∈[1e-3,1e3] s, dx=160 m, nx=120 (same UNET_MESH)")
+        println(io, data_footnote(tag))
         println(io, "Yorum: ", interpretation)
         println(io, "")
         println(io, "See also: results/KNOWN_LIMITATIONS.md")
-        println(io, "Training curve: results/training_curve_v8_tetm_n200_dx160.png")
+        println(io, "Training curve: ", training_curve_relpath(tag))
     end
     println("  → $table_path")
 
     # ── Step 4: Predicted vs true heatmap ────────────────────────────────────
     println("\n[4/4] Plotting predicted prior vs resampled COMMEMI true model...")
     png_path = joinpath(results_dir, "predicted_vs_true.png")
-    plot_predicted_vs_true(pred_logres, truth, png_path)
+    plot_predicted_vs_true(pred_logres, truth, png_path;
+                           pred_title="U-Net $ver prior ($tag)")
     println("  → $png_path")
 
     println("\n", "═" ^ 72)

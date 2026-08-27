@@ -1,0 +1,12 @@
+Five-way COMMEMI RMS comparison (1 chain, 200 ctrl, 100 iter, seed=20260308)
+v2 checkpoint: models/mid_scale_prior_v2.jld2
+VFSA run_dir:  /Users/hayrunnisayildiz/PriorModel/scripts/run_VFSA2DMT_20260819_151533
+
+  Homojen:                              initial=12.3100       best=5.7354      
+  U-Net (20 örnek/10ep):                initial=61.5000       best=8.3573      
+  U-Net (180/25ep, v1):                 initial=54.3900       best=9.9083      
+  U-Net (180/25ep, v2*):                initial=7.9178        best=4.8981      
+  Gerçek model (sanity):                initial=1.3000        best=1.3002      
+
+*v2 = düzeltilmiş train/val split + LR + grad clipping + best_val checkpoint
+Yorum: Homojeni geçti — production ölçeğine (n=1000+) geçmeye hazır
